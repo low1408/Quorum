@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import { DBService } from '../db/database.ts';
 import { OrchestrationRunner, type RunnerTimeoutBudgets } from './runner.ts';
-import type { ValidatedCouncilContext } from '../mcp/contextValidation.ts';
+import { validateCouncilRequestText, type ValidatedCouncilContext } from '../mcp/contextValidation.ts';
 import { validateProviderList, normalizeProviderId } from '../adapters/registry.ts';
 import { closeSessionItem, ProviderSessionPool, type SessionPoolItem } from './providerSessionPool.ts';
 import { createCancelledError, isAbortError } from './statuses.ts';
@@ -458,6 +458,7 @@ export async function runCouncilConsultation(request: CouncilConsultationRequest
   const runId = `council_run_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
 
   try {
+    validateCouncilRequestText(request.question, request.constraints);
     uniqueProviders(request.providers);
     const consolidatorProvider = process.env.COUNCIL_CONSOLIDATOR_PROVIDER;
     if (consolidatorProvider) validateProviderList([consolidatorProvider], 'consolidator provider');

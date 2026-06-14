@@ -55,6 +55,9 @@ const SECRET_PATTERNS = [
   /\b(?:api[_-]?key|secret|token|password|passwd|credential)\b\s*[:=]\s*["']?[A-Za-z0-9_./+=-]{16,}/i,
   /\bAWS_SECRET_ACCESS_KEY\b\s*[:=]\s*["']?[A-Za-z0-9/+=]{30,}/i
 ];
+const CONTEXT_KEYS = new Set(['files', 'notes', 'structured_review']);
+const CONTEXT_FILE_KEYS = new Set(['path', 'content', 'sha256', 'modified_at', 'relevance']);
+const TEXT_FIELD_MAX_CHARS = 50_000;
 
 function normalizeContextPath(rawPath: string): string {
   if (typeof rawPath !== 'string' || rawPath.trim() === '') {
@@ -101,6 +104,64 @@ function hasSecretMaterial(content: string): boolean {
   return SECRET_PATTERNS.some(pattern => pattern.test(content));
 }
 
+function assertNoUnknownKeys(value: Record<string, unknown>, allowed: Set<string>, label: string): void {
+  const unknown = Object.keys(value).filter(key => !allowed.has(key));
+  if (unknown.length > 0) {
+    throw new Error(`${label} contains unknown field(s): ${unknown.join(', ')}.`);
+  }
+}
+
+function validateTextField(value: unknown, label: string, options: {
+  required?: boolean;
+  maxChars?: number;
+} = {}): string | undefined {
+  if (value === undefined || value === null) {
+    if (options.required) throw new Error(`${label} is required.`);
+    return undefined;
+  }
+  if (typeof value !== 'string') {
+    throw new Error(`${label} must be a string.`);
+  }
+  if (options.required && value.trim() === '') {
+    throw new Error(`${label} must be non-empty.`);
+  }
+  const maxChars = options.maxChars ?? TEXT_FIELD_MAX_CHARS;
+  if (value.length > maxChars) {
+    throw new Error(`${label} exceeds ${maxChars} characters.`);
+  }
+  if (looksBinary(value)) {
+    throw new Error(`${label} appears to be binary.`);
+  }
+  if (hasSecretMaterial(value)) {
+    throw new Error(`${label} appears to contain secret material.`);
+  }
+  return value;
+}
+
+function assertSafeContextPath(normalizedPath: string): void {
+  const lower = normalizedPath.toLowerCase();
+  const basename = path.posix.basename(lower);
+  const safeEnvExamples = new Set(['.env.example', 'env.example']);
+  const isEnvFile = basename === '.env' || basename.startsWith('.env.');
+  const sensitive =
+    (isEnvFile && !safeEnvExamples.has(basename)) ||
+    lower === '.git' ||
+    lower.startsWith('.git/') ||
+    lower.startsWith('sessions/') ||
+    lower.startsWith('quorum/') ||
+    lower.endsWith('.log') ||
+    lower.endsWith('.db') ||
+    lower.endsWith('.sqlite') ||
+    lower.endsWith('.sqlite3') ||
+    lower.includes('private_key') ||
+    lower.endsWith('.pem') ||
+    lower.endsWith('.key');
+
+  if (sensitive) {
+    throw new Error(`Context file path is sensitive and cannot be sent to the council: ${normalizedPath}`);
+  }
+}
+
 function validateStructuredReviewContext(context: CouncilContext, warnings: string[]): CouncilStructuredReviewContext | undefined {
   const structured = context.structured_review;
   if (!structured) {
@@ -109,6 +170,8 @@ function validateStructuredReviewContext(context: CouncilContext, warnings: stri
     }
     return undefined;
   }
+
+  assertNoUnknownKeys(structured as unknown as Record<string, unknown>, new Set(STRUCTURED_REVIEW_FIELDS), 'Structured review context');
 
   const missingFields = STRUCTURED_REVIEW_FIELDS.filter(field => {
     const value = structured[field];
@@ -119,16 +182,10 @@ function validateStructuredReviewContext(context: CouncilContext, warnings: stri
   }
 
   for (const field of STRUCTURED_REVIEW_FIELDS) {
-    const value = structured[field];
-    if (value.length > MAX_FILE_CHARS) {
-      throw new Error(`Structured review context field exceeds ${MAX_FILE_CHARS} characters: ${field}.`);
-    }
-    if (looksBinary(value)) {
-      throw new Error(`Structured review context field appears to be binary: ${field}.`);
-    }
-    if (hasSecretMaterial(value)) {
-      throw new Error(`Structured review context field appears to contain secret material: ${field}.`);
-    }
+    validateTextField(structured[field], `Structured review context field ${field}`, {
+      required: true,
+      maxChars: MAX_FILE_CHARS
+    });
   }
 
   if (!config.requireStructuredReviewContext) {
@@ -136,6 +193,10 @@ function validateStructuredReviewContext(context: CouncilContext, warnings: stri
   }
 
   return structured;
+}
+
+function referencedRepositoryPaths(text: string): string[] {
+  return text.match(/[A-Za-z0-9_./-]+\.(?:ts|tsx|js|jsx|json|md|yml|yaml)/g) || [];
 }
 
 function candidateImportPaths(content: string): string[] {
@@ -199,7 +260,7 @@ function addCompletenessWarnings(files: Array<CouncilContextFile & { normalizedP
     }
   }
 
-  const referencedPaths = question.match(/[A-Za-z0-9_./-]+\.(?:ts|tsx|js|jsx|json|md|yml|yaml)/g) || [];
+  const referencedPaths = referencedRepositoryPaths(question);
   for (const referencedPath of referencedPaths) {
     const normalized = normalizeContextPath(referencedPath);
     if (!included.has(normalized) && fs.existsSync(path.resolve(config.rootDir, normalized))) {
@@ -208,13 +269,41 @@ function addCompletenessWarnings(files: Array<CouncilContextFile & { normalizedP
   }
 }
 
+function addStructuredContextWarnings(context: CouncilStructuredReviewContext | undefined, files: Array<CouncilContextFile & { normalizedPath: string }>, warnings: string[]): void {
+  if (!context) return;
+
+  const included = new Set(files.map(file => file.normalizedPath));
+  for (const field of ['core_evidence', 'supporting_contracts'] as const) {
+    for (const referencedPath of referencedRepositoryPaths(context[field])) {
+      const normalized = normalizeContextPath(referencedPath);
+      if (!included.has(normalized) && fs.existsSync(path.resolve(config.rootDir, normalized))) {
+        warnings.push(`Structured review field ${field} references ${normalized}, but that file was not included in context.`);
+      }
+    }
+  }
+
+  for (const referencedPath of referencedRepositoryPaths(context.omitted_material)) {
+    const normalized = normalizeContextPath(referencedPath);
+    if (included.has(normalized)) {
+      warnings.push(`Structured review omitted_material says ${normalized} is omitted, but it was included in context.`);
+    }
+  }
+}
+
+export function validateCouncilRequestText(question: string, constraints?: string): void {
+  validateTextField(question, 'Question', { required: true });
+  validateTextField(constraints, 'Constraints');
+}
+
 export function validateCouncilContext(context: CouncilContext, question = ''): ValidatedCouncilContext {
-  if (!context || !Array.isArray(context.files)) {
+  if (!context || typeof context !== 'object' || !Array.isArray(context.files)) {
     throw new Error('Context must include a files array.');
   }
+  assertNoUnknownKeys(context as unknown as Record<string, unknown>, CONTEXT_KEYS, 'Context');
   if (context.files.length === 0) {
     throw new Error('Context must include at least one file.');
   }
+  validateTextField(context.notes, 'Context notes');
 
   const seen = new Set<string>();
   const warnings: string[] = [];
@@ -229,11 +318,17 @@ export function validateCouncilContext(context: CouncilContext, question = ''): 
   }
 
   for (const file of context.files) {
+    if (!file || typeof file !== 'object') {
+      throw new Error('Context file must be an object.');
+    }
+    assertNoUnknownKeys(file as unknown as Record<string, unknown>, CONTEXT_FILE_KEYS, 'Context file');
     const normalizedPath = normalizeContextPath(file.path);
+    assertSafeContextPath(normalizedPath);
     if (seen.has(normalizedPath)) {
       throw new Error(`Duplicate context file: ${normalizedPath}`);
     }
     seen.add(normalizedPath);
+    validateTextField(file.relevance, `Context file relevance for ${normalizedPath}`, { maxChars: 2_000 });
 
     if (typeof file.content !== 'string' || file.content.trim() === '') {
       throw new Error(`Context file is empty: ${normalizedPath}`);
@@ -282,6 +377,7 @@ export function validateCouncilContext(context: CouncilContext, question = ''): 
   }
 
   addCompletenessWarnings(files, `${question}\n${context.notes || ''}`, warnings);
+  addStructuredContextWarnings(structuredReview, files, warnings);
 
   return {
     files,
