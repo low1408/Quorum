@@ -83,7 +83,7 @@ export class ProviderSessionPool {
   }
 }
 
-export async function closeSessionItem(item: SessionPoolItem, _reason = 'cleanup'): Promise<void> {
+export async function closeSessionItem(item: SessionPoolItem, reason = 'cleanup'): Promise<void> {
   const page = item.page;
   const context = item.context;
   const browser = item.browser;
@@ -98,14 +98,14 @@ export async function closeSessionItem(item: SessionPoolItem, _reason = 'cleanup
   item.hasActiveThread = false;
 
   if (page && ownsPage) {
-    await page.close().catch(() => {});
+    console.log(`[KEEP-ALIVE] Keeping page open (requested close reason: ${reason})`);
   }
 
   if (context && ownsContext) {
-    await context.close().catch(() => {});
+    console.log(`[KEEP-ALIVE] Keeping context open (requested close reason: ${reason})`);
   }
 
   if (browser && ownsBrowser) {
-    await browser.close().catch(() => {});
+    console.log(`[KEEP-ALIVE] Keeping browser open (requested close reason: ${reason})`);
   }
 }
