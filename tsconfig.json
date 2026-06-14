@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "types": ["node"],
+    "noEmit": true,
+    "allowImportingTsExtensions": true
+  },
+  "include": [
+    "from_orchestrator/adapters/**/*.ts",
+    "from_orchestrator/config/**/*.ts",
+    "from_orchestrator/db/**/*.ts",
+    "from_orchestrator/engine/council.ts",
+    "from_orchestrator/engine/runner.ts",
+    "from_orchestrator/mcp/**/*.ts",
+    "from_orchestrator/security/**/*.ts",
+    "from_orchestrator/types/**/*.d.ts",
+    "from_orchestrator/tools/**/*.ts",
+    "tests/**/*.ts"
+  ]
+}
