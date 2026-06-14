@@ -2,6 +2,7 @@ import { OrchestrationRunner } from './runner.ts';
 import type { SessionPoolItem } from './runner.ts';
 import { DBService } from '../db/database.ts';
 import { config } from '../config/index.ts';
+import { isAbortError } from './statuses.ts';
 
 /**
  * Multi-LLM Debate Orchestrator Engine.
@@ -26,6 +27,9 @@ export async function runDebate(
   let previousTaskId: string | null = null;
 
   try {
+    DBService.createRun(runId, topic.substring(0, 100));
+    DBService.updateRunStatusIfNotTerminal(runId, 'IN_PROGRESS');
+
     for (let round = 0; round < roundsCount; round++) {
       const currentProvider = providers[round % providers.length];
       const currentTaskId = `debate_task_r${round + 1}_${currentProvider}_${Date.now()}`;
@@ -41,15 +45,13 @@ export async function runDebate(
       // 1. Build prompt based on debate context & page keep-alive history
       let prompt = '';
 
-      const lastProviderRoundIdx = debateHistory.map(h => h.provider).lastIndexOf(currentProvider);
-
-      if (lastProviderRoundIdx === -1) {
-        // First time this provider is speaking in this debate session
+      if (!poolItem.hasActiveThread) {
+        // Fresh provider session or lost continuity. Generate a self-contained history summary.
         if (round === 0) {
           // Absolute first round of the debate
           prompt = `You are a debater participating in a panel debate on the topic: "${topic}".`;
         } else {
-          // First time this provider speaks, but other rounds have occurred. Load full history up to now.
+          // Continuity lost or first time speaking but other rounds have occurred. Load full history up to now.
           const historySummary = debateHistory
             .map((h, idx) => `Round ${idx + 1} (${h.provider.toUpperCase()}): "${h.argument}"`)
             .join('\n');
@@ -58,8 +60,9 @@ export async function runDebate(
             `Here is the debate history so far:\n${historySummary}`;
         }
       } else {
-        // This provider has already spoken. Its open browser tab already contains context up to its last turn.
+        // This provider has already spoken and has an active chat thread open in its tab.
         // We only feed it new arguments formulated by other opponents since its own last turn!
+        const lastProviderRoundIdx = debateHistory.map(h => h.provider).lastIndexOf(currentProvider);
         const newArguments = debateHistory.slice(lastProviderRoundIdx + 1);
         const newHistorySummary = newArguments
           .map((h) => `${h.provider.toUpperCase()} said:\n"${h.argument}"`)
@@ -69,8 +72,8 @@ export async function runDebate(
           `${newHistorySummary}`;
       }
 
-      // 2. Instantiate and run orchestrator for this model with page pool item
-      const runner = new OrchestrationRunner(runId, currentTaskId, currentProvider);
+      // 2. Instantiate and run orchestrator for this model with page pool item (manageRunStatus: false)
+      const runner = new OrchestrationRunner(runId, currentTaskId, currentProvider, { manageRunStatus: false });
 
       const argument = await runner.executeTask(prompt, poolItem);
 
@@ -98,6 +101,8 @@ export async function runDebate(
       await new Promise((resolve) => setTimeout(resolve, 3000));
     }
 
+    DBService.updateRunStatusIfNotTerminal(runId, 'COMPLETED');
+
     console.log('\n============================================================');
     console.log('        🎉 DEBATE COMPLETED SUCCESSFULLY 🎉');
     console.log('============================================================');
@@ -113,9 +118,12 @@ export async function runDebate(
 
   } catch (err: any) {
     console.error(`❌ Debate interrupted: ${err.message}`);
+    const finalStatus = isAbortError(err) ? 'CANCELLED' : 'FAILED';
+    DBService.updateRunStatusIfNotTerminal(runId, finalStatus);
     throw err;
   } finally {
     // Keep browser sessions open after debate end as requested by the user
     console.log('\n[INFO] Keeping all active debate browser sessions open for visual inspection.\n');
   }
 }
+

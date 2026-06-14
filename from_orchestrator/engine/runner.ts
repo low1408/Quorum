@@ -280,6 +280,7 @@ export class OrchestrationRunner {
           ownsPage = true;
           poolItem.page = page;
           poolItem.ownsPage = true;
+          poolItem.hasActiveThread = false;
           console.log(`Navigating to ${this.adapter.baseUrl}...`);
           await withStageTimeout('navigation', timeouts.navigationMs, page.goto(this.adapter.baseUrl, { waitUntil: 'domcontentloaded', timeout: timeouts.navigationMs }), signal);
         }
@@ -597,6 +598,7 @@ export class OrchestrationRunner {
           console.log(`Persistent tab for [${this.adapter.providerId.toUpperCase()}] is closed/missing. Spawning a NEW tab...`);
           page = await context!.newPage();
           poolItem.page = page;
+          poolItem.hasActiveThread = false;
           console.log(`Navigating to ${this.adapter.baseUrl}...`);
           await page.goto(this.adapter.baseUrl, { waitUntil: 'domcontentloaded' });
         }
