@@ -191,11 +191,10 @@ async function closeTransientPoolPage(poolItem: SessionPoolItem, label: string):
 
   try {
     if (!page.isClosed?.()) {
-      await page.close();
-      console.log(`🧹 [TAB CLEANUP] Closed transient tab for ${label}.`);
+      console.log(`🧹 [TAB KEEP-ALIVE] Keeping transient tab open for ${label}.`);
     }
   } catch (err: any) {
-    console.warn(`⚠️ [TAB CLEANUP] Failed to close transient tab for ${label}: ${err.message}`);
+    console.warn(`⚠️ [TAB KEEP-ALIVE] Failed to keep transient tab open for ${label}: ${err.message}`);
   } finally {
     poolItem.page = null;
     poolItem.hasActiveThread = false;
