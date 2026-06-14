@@ -11,8 +11,26 @@ const contextFileSchema = z.object({
   content: z.string(),
   sha256: z.string().optional(),
   modified_at: z.string().optional(),
-  relevance: z.string().optional()
-});
+  relevance: z.string().optional(),
+  start_line: z.number().int().positive().optional(),
+  end_line: z.number().int().positive().optional(),
+  total_lines: z.number().int().positive().optional(),
+  is_excerpt: z.boolean().optional()
+}).strict();
+
+const evidenceManifestItemSchema = z.object({
+  id: z.string(),
+  path: z.string(),
+  sha256: z.string().optional(),
+  role: z.enum(['core', 'contract', 'config', 'test', 'runtime', 'supporting']),
+  provenance: z.enum(['repository', 'generated', 'test-runtime', 'caller-supplied']),
+  relevance: z.string(),
+  order: z.number().int().optional(),
+  start_line: z.number().int().positive().optional(),
+  end_line: z.number().int().positive().optional(),
+  total_lines: z.number().int().positive().optional(),
+  is_excerpt: z.boolean().optional()
+}).strict();
 
 const structuredReviewSchema = z.object({
   review_objective: z.string(),
@@ -24,15 +42,17 @@ const structuredReviewSchema = z.object({
   privacy_and_persistence: z.string(),
   tests_and_runtime_evidence: z.string(),
   omitted_material: z.string()
-});
+}).strict();
 
 const consultCouncilSchema = {
   question: z.string().min(1),
   context: z.object({
+    schema_version: z.string().optional(),
     files: z.array(contextFileSchema).min(1),
     notes: z.string().optional(),
+    evidence_manifest: z.array(evidenceManifestItemSchema).optional(),
     structured_review: structuredReviewSchema.optional()
-  }),
+  }).strict(),
   constraints: z.string().optional(),
   providers: z.array(z.string().min(1)).optional().superRefine((providers, ctx) => {
     if (!providers) return;
