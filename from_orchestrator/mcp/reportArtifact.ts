@@ -9,12 +9,12 @@ export type CouncilReportArtifact = {
   memberPaths: { provider: string; absolutePath: string; relativePath: string }[];
 };
 
-function safeRunId(runId: string): string {
-  return runId.replace(/[^a-zA-Z0-9_-]/g, '_');
-}
-
 function safeProvider(provider: string): string {
   return provider.replace(/[^a-zA-Z0-9_-]/g, '_').toLowerCase();
+}
+
+function safeRunId(runId: string): string {
+  return runId.replace(/[^a-zA-Z0-9_-]/g, '_');
 }
 
 function buildMemberMarkdown(provider: string, response: string, runId: string): string {
@@ -51,21 +51,21 @@ function buildCouncilReportMarkdown(result: CouncilConsultationResult): string {
 }
 
 export async function saveCouncilReportArtifact(result: CouncilConsultationResult): Promise<CouncilReportArtifact> {
-  const runFolder = path.join('quorum', safeRunId(result.run_id));
-  const absoluteRunFolder = path.resolve(config.rootDir, runFolder);
+  const outputFolder = 'quorum';
+  const absoluteOutputFolder = path.resolve(config.rootDir, outputFolder);
 
-  await fs.mkdir(absoluteRunFolder, { recursive: true });
+  await fs.mkdir(absoluteOutputFolder, { recursive: true });
 
   // Save the combined council report
-  const reportRelativePath = path.join(runFolder, 'council_report.md');
+  const reportRelativePath = path.join(outputFolder, 'council_report.md');
   const reportAbsolutePath = path.resolve(config.rootDir, reportRelativePath);
   await fs.writeFile(reportAbsolutePath, buildCouncilReportMarkdown(result), 'utf8');
 
   // Save individual member responses, one file per provider
   const memberPaths: CouncilReportArtifact['memberPaths'] = [];
   for (const analysis of result.analyses ?? []) {
-    const memberFileName = `${safeProvider(analysis.provider)}.md`;
-    const memberRelativePath = path.join(runFolder, memberFileName);
+    const memberFileName = `${safeProvider(analysis.provider)}_${safeRunId(result.run_id)}.md`;
+    const memberRelativePath = path.join(outputFolder, memberFileName);
     const memberAbsolutePath = path.resolve(config.rootDir, memberRelativePath);
     await fs.writeFile(
       memberAbsolutePath,

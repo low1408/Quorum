@@ -12,7 +12,6 @@ import { classifyFailure } from './failures.ts';
 import type { FailureClassification } from './failures.ts';
 import {
   uniqueProviders,
-  trustBoundaryInstruction,
   reviewerContract,
   renderContextWarnings,
   renderRepositoryEvidence,
@@ -88,8 +87,6 @@ export function buildCouncilDebatePrompt(params: {
   return [
     `You are participating in a multi-round council debate advising a coding agent.`,
     roleInstruction,
-    `Do not mention your model name, provider identity, or other model names. Refer to other members only by their reviewer labels (e.g., REVIEWER 1, REVIEWER 2).`,
-    trustBoundaryInstruction(),
     reviewerContract(),
     '',
     `QUESTION:\n${params.question}`,
@@ -125,8 +122,6 @@ export function buildCouncilDecisionPrompt(params: {
   return [
     `You are participating in the final round of a council debate advising a coding agent.`,
     `You are ${params.reviewerLabel}.`,
-    `Do not mention your model name, provider identity, or other model names. Refer to other members only by their reviewer labels (e.g., REVIEWER 1, REVIEWER 2).`,
-    trustBoundaryInstruction(),
     '',
     `QUESTION:\n${params.question}`,
     params.constraints ? `CONSTRAINTS:\n${params.constraints}` : '',

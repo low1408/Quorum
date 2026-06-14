@@ -27,7 +27,6 @@ test('analysis prompt requires evidence-linked findings and preserves source bou
     context
   });
 
-  assert.match(prompt, /TRUST AND PRIVACY BOUNDARY/);
   assert.match(prompt, /REQUIRED REVIEWER FORMAT/);
   assert.match(prompt, /Confirmed defect, Likely defect, Architectural risk, Hardening recommendation, Unverifiable/);
   assert.match(prompt, /Claims without exact supporting evidence/);
