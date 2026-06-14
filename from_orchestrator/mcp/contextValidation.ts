@@ -14,16 +14,41 @@ export type CouncilContextFile = {
 export type CouncilContext = {
   files: CouncilContextFile[];
   notes?: string;
+  structured_review?: CouncilStructuredReviewContext;
 };
 
 export type ValidatedCouncilContext = {
   files: Array<CouncilContextFile & { normalizedPath: string; computedSha256: string }>;
   notes?: string;
+  structured_review?: CouncilStructuredReviewContext;
   warnings: string[];
+};
+
+export type CouncilStructuredReviewContext = {
+  review_objective: string;
+  architecture: string;
+  execution_flow: string;
+  assumptions_and_invariants: string;
+  core_evidence: string;
+  supporting_contracts: string;
+  privacy_and_persistence: string;
+  tests_and_runtime_evidence: string;
+  omitted_material: string;
 };
 
 const MAX_FILE_CHARS = 250_000;
 const MAX_TOTAL_CHARS = 750_000;
+const STRUCTURED_REVIEW_FIELDS: Array<keyof CouncilStructuredReviewContext> = [
+  'review_objective',
+  'architecture',
+  'execution_flow',
+  'assumptions_and_invariants',
+  'core_evidence',
+  'supporting_contracts',
+  'privacy_and_persistence',
+  'tests_and_runtime_evidence',
+  'omitted_material'
+];
 const SECRET_PATTERNS = [
   /-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----/,
   /\b(?:sk|pk|rk|xox[baprs])-[-A-Za-z0-9_]{20,}\b/,
@@ -74,6 +99,43 @@ function sha256(content: string): string {
 
 function hasSecretMaterial(content: string): boolean {
   return SECRET_PATTERNS.some(pattern => pattern.test(content));
+}
+
+function validateStructuredReviewContext(context: CouncilContext, warnings: string[]): CouncilStructuredReviewContext | undefined {
+  const structured = context.structured_review;
+  if (!structured) {
+    if (config.requireStructuredReviewContext) {
+      throw new Error('Structured review context is required when REQUIRE_STRUCTURED_REVIEW_CONTEXT=true.');
+    }
+    return undefined;
+  }
+
+  const missingFields = STRUCTURED_REVIEW_FIELDS.filter(field => {
+    const value = structured[field];
+    return typeof value !== 'string' || value.trim() === '';
+  });
+  if (missingFields.length > 0) {
+    throw new Error(`Structured review context is missing required field(s): ${missingFields.join(', ')}.`);
+  }
+
+  for (const field of STRUCTURED_REVIEW_FIELDS) {
+    const value = structured[field];
+    if (value.length > MAX_FILE_CHARS) {
+      throw new Error(`Structured review context field exceeds ${MAX_FILE_CHARS} characters: ${field}.`);
+    }
+    if (looksBinary(value)) {
+      throw new Error(`Structured review context field appears to be binary: ${field}.`);
+    }
+    if (hasSecretMaterial(value)) {
+      throw new Error(`Structured review context field appears to contain secret material: ${field}.`);
+    }
+  }
+
+  if (!config.requireStructuredReviewContext) {
+    warnings.push('Structured review context was provided but is not currently required by server configuration.');
+  }
+
+  return structured;
 }
 
 function candidateImportPaths(content: string): string[] {
@@ -156,8 +218,15 @@ export function validateCouncilContext(context: CouncilContext, question = ''): 
 
   const seen = new Set<string>();
   const warnings: string[] = [];
+  const structuredReview = validateStructuredReviewContext(context, warnings);
   const files: ValidatedCouncilContext['files'] = [];
-  let totalChars = 0;
+  let totalChars = structuredReview
+    ? STRUCTURED_REVIEW_FIELDS.reduce((sum, field) => sum + structuredReview[field].length, 0)
+    : 0;
+
+  if (totalChars > MAX_TOTAL_CHARS) {
+    throw new Error(`Context exceeds ${MAX_TOTAL_CHARS} total characters.`);
+  }
 
   for (const file of context.files) {
     const normalizedPath = normalizeContextPath(file.path);
@@ -217,6 +286,7 @@ export function validateCouncilContext(context: CouncilContext, question = ''): 
   return {
     files,
     notes: context.notes,
+    structured_review: structuredReview,
     warnings: Array.from(new Set(warnings))
   };
 }

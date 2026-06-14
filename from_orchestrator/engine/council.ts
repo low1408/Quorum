@@ -3,7 +3,7 @@ import { DBService } from '../db/database.ts';
 import { OrchestrationRunner, type RunnerTimeoutBudgets } from './runner.ts';
 import type { ValidatedCouncilContext } from '../mcp/contextValidation.ts';
 import { validateProviderList, normalizeProviderId } from '../adapters/registry.ts';
-import { ProviderSessionPool, type SessionPoolItem } from './providerSessionPool.ts';
+import { closeSessionItem, ProviderSessionPool, type SessionPoolItem } from './providerSessionPool.ts';
 import { createCancelledError, isAbortError } from './statuses.ts';
 import { classifyFailure, type FailureClassification } from './failures.ts';
 
@@ -49,7 +49,7 @@ export type CouncilRunnerFactory = (params: {
   provider: string;
 }) => CouncilRunner;
 
-const DEFAULT_PROVIDERS = (process.env.COUNCIL_PROVIDERS || 'chatgpt,gemini,claude')
+const DEFAULT_PROVIDERS = (process.env.COUNCIL_PROVIDERS || 'chatgpt,gemini,meta,kimi,claude')
   .split(',')
   .map(provider => provider.trim())
   .filter(Boolean);
@@ -63,11 +63,58 @@ function anonymizedSourceLabel(index: number): string {
   return `ANALYSIS ${index + 1}`;
 }
 
+function createFreshProviderSession(source?: SessionPoolItem): SessionPoolItem {
+  return {
+    browser: source?.browser || null,
+    context: source?.context || null,
+    page: null,
+    hasActiveThread: false,
+    isCdp: source?.isCdp,
+    ownsBrowser: source?.browser ? false : undefined,
+    ownsContext: source?.context ? false : undefined,
+    ownsPage: true,
+    providerId: source?.providerId,
+    createdAt: Date.now(),
+    lastUsedAt: Date.now()
+  };
+}
+
+function acquireConsolidationSession(pool: ProviderSessionPool, provider: string): {
+  session: SessionPoolItem;
+  transient: boolean;
+} {
+  const existing = pool.get(provider);
+  if (existing && !existing.invalidated && (existing.browser || existing.context || existing.page)) {
+    return {
+      session: createFreshProviderSession(existing),
+      transient: true
+    };
+  }
+
+  return {
+    session: pool.acquire(provider),
+    transient: false
+  };
+}
+
 export function buildCouncilAnalysisPrompt(params: {
   question: string;
   context: ValidatedCouncilContext;
   constraints?: string;
 }): string {
+  const structured = params.context.structured_review
+    ? [
+      `REVIEW OBJECTIVE:\n${params.context.structured_review.review_objective}`,
+      `ARCHITECTURE:\n${params.context.structured_review.architecture}`,
+      `EXECUTION FLOW:\n${params.context.structured_review.execution_flow}`,
+      `ASSUMPTIONS AND INVARIANTS:\n${params.context.structured_review.assumptions_and_invariants}`,
+      `CORE EVIDENCE:\n${params.context.structured_review.core_evidence}`,
+      `SUPPORTING CONTRACTS:\n${params.context.structured_review.supporting_contracts}`,
+      `PRIVACY AND PERSISTENCE:\n${params.context.structured_review.privacy_and_persistence}`,
+      `TESTS AND RUNTIME EVIDENCE:\n${params.context.structured_review.tests_and_runtime_evidence}`,
+      `OMITTED MATERIAL:\n${params.context.structured_review.omitted_material}`
+    ].join('\n\n')
+    : '';
   const contextBlocks = params.context.files.map(file =>
     `--- FILE: ${file.normalizedPath} ---\n${file.content}`
   ).join('\n\n');
@@ -81,6 +128,7 @@ export function buildCouncilAnalysisPrompt(params: {
     `QUESTION:\n${params.question}`,
     params.constraints ? `CONSTRAINTS:\n${params.constraints}` : '',
     params.context.notes ? `CALLER CONTEXT NOTES:\n${params.context.notes}` : '',
+    structured ? `STRUCTURED REVIEW CONTEXT:\n${structured}` : '',
     `REPOSITORY CONTEXT:\n${contextBlocks}`
   ].filter(Boolean).join('\n\n');
 }
@@ -298,20 +346,28 @@ async function runCouncilConsultationInner(request: CouncilConsultationRequest, 
     const consolidationTimeout = perProviderTimeoutMs;
     const runner = runnerFactory({ runId, taskId: consolidationTaskId, provider: consolidatorProvider });
     const controller = timeoutSignal(consolidationTimeout, `consolidation timed out after ${consolidationTimeout}ms.`);
+    const consolidationSession = acquireConsolidationSession(pool, consolidatorProvider);
     let report: string;
     try {
-      report = await runner.executeTask(consolidationPrompt, pool.acquire(consolidatorProvider), {
+      report = await runner.executeTask(consolidationPrompt, consolidationSession.session, {
         signal: controller.signal,
         timeouts: { providerExecutionMs: consolidationTimeout, ...request.timeouts },
         attemptNo: 1
       });
     } catch (err: any) {
-      await pool.invalidate(consolidatorProvider, err?.message || String(err)).catch(() => {});
+      if (consolidationSession.transient) {
+        await closeSessionItem(consolidationSession.session, err?.message || String(err)).catch(() => {});
+      } else {
+        await pool.invalidate(consolidatorProvider, err?.message || String(err)).catch(() => {});
+      }
       DBService.updateRunStatusIfNotTerminal(runId, 'FAILED');
       throw new Error(`Council consolidation failed after ${analyses.length} successful analyses: ${err?.message || String(err)}`);
     } finally {
       controller.abort(createCancelledError('consolidation finished.'));
       await runner.close().catch(() => {});
+      if (consolidationSession.transient) {
+        await closeSessionItem(consolidationSession.session, 'council consolidation finished').catch(() => {});
+      }
     }
 
     for (const analysis of analyses) {

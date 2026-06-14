@@ -14,11 +14,24 @@ const contextFileSchema = z.object({
   relevance: z.string().optional()
 });
 
+const structuredReviewSchema = z.object({
+  review_objective: z.string(),
+  architecture: z.string(),
+  execution_flow: z.string(),
+  assumptions_and_invariants: z.string(),
+  core_evidence: z.string(),
+  supporting_contracts: z.string(),
+  privacy_and_persistence: z.string(),
+  tests_and_runtime_evidence: z.string(),
+  omitted_material: z.string()
+});
+
 const consultCouncilSchema = {
   question: z.string().min(1),
   context: z.object({
     files: z.array(contextFileSchema).min(1),
-    notes: z.string().optional()
+    notes: z.string().optional(),
+    structured_review: structuredReviewSchema.optional()
   }),
   constraints: z.string().optional(),
   providers: z.array(z.string().min(1)).optional().superRefine((providers, ctx) => {
@@ -78,6 +91,8 @@ server.registerTool(
 );
 
 async function main(): Promise<void> {
+  console.log = console.error;
+  console.info = console.error;
   const transport = new StdioServerTransport();
   const shutdown = async (signal: string) => {
     console.error(`Received ${signal}; shutting down MCP transport.`);

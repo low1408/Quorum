@@ -20,6 +20,7 @@ export const config = {
   chatgptBaseUrl: process.env.CHATGPT_BASE_URL || 'https://chatgpt.com',
   sessionStorageDir: path.resolve(rootDir, './sessions'),
   limitDebateResponses: process.env.LIMIT_DEBATE_RESPONSES !== 'false',
+  requireStructuredReviewContext: process.env.REQUIRE_STRUCTURED_REVIEW_CONTEXT === 'true',
   rootDir,
 };
 

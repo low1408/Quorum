@@ -86,3 +86,25 @@ Validate generation, required sections, and basic privacy exclusions with:
 ```bash
 npm run review-context:test
 ```
+
+## Enforcing Structured MCP Context
+
+Set this environment variable on the MCP server to reject raw-only `consult_council` requests:
+
+```bash
+REQUIRE_STRUCTURED_REVIEW_CONTEXT=true
+```
+
+When enabled, callers must include `context.structured_review` with these non-empty fields:
+
+- `review_objective`
+- `architecture`
+- `execution_flow`
+- `assumptions_and_invariants`
+- `core_evidence`
+- `supporting_contracts`
+- `privacy_and_persistence`
+- `tests_and_runtime_evidence`
+- `omitted_material`
+
+The ordinary `context.files` array is still required so the council receives source evidence with file boundaries. The structured fields force callers to provide orientation, evidence grouping, runtime/test evidence, and explicit omissions instead of sending an unframed raw code dump.

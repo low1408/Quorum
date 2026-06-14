@@ -10,6 +10,20 @@ function digest(value: string): string {
   return crypto.createHash('sha256').update(value).digest('hex');
 }
 
+function structuredReviewContext() {
+  return {
+    review_objective: 'Review lifecycle behavior.',
+    architecture: 'mcp -> validation -> council -> runner -> db',
+    execution_flow: 'consult_council validates context, runs providers, persists tasks, returns report.',
+    assumptions_and_invariants: 'Terminal task states are not overwritten.',
+    core_evidence: 'Complete council and runner paths are included.',
+    supporting_contracts: 'Adapter and session pool contracts are included.',
+    privacy_and_persistence: 'Secret checks and DB status updates are included.',
+    tests_and_runtime_evidence: 'npm test output and sanitized rows are included.',
+    omitted_material: 'Provider-specific adapters are omitted as peripheral.'
+  };
+}
+
 test('rejects malformed, duplicate, empty, oversized, binary, secret, and stale context', () => {
   assert.throws(() => validateCouncilContext({ files: [{ path: '../x.ts', content: 'x' }] }), /escapes/);
   assert.throws(() => validateCouncilContext({ files: [
@@ -43,4 +57,60 @@ test('detects disk-stale hashes and warns about missing local imports', () => {
 
   assert.match(validation.warnings.join('\n'), /omitted local imports/);
   assert.match(validation.warnings.join('\n'), /package\.json/);
+});
+
+test('structured review context is optional unless enforcement is enabled', () => {
+  const previous = config.requireStructuredReviewContext;
+  config.requireStructuredReviewContext = false;
+  try {
+    const validation = validateCouncilContext({
+      files: [{ path: 'virtual.ts', content: 'export const value = 1;' }]
+    });
+
+    assert.equal(validation.structured_review, undefined);
+  } finally {
+    config.requireStructuredReviewContext = previous;
+  }
+});
+
+test('enforced structured review context rejects raw-only and incomplete requests', () => {
+  const previous = config.requireStructuredReviewContext;
+  config.requireStructuredReviewContext = true;
+  try {
+    assert.throws(
+      () => validateCouncilContext({
+        files: [{ path: 'virtual.ts', content: 'export const value = 1;' }]
+      }),
+      /Structured review context is required/
+    );
+
+    assert.throws(
+      () => validateCouncilContext({
+        files: [{ path: 'virtual.ts', content: 'export const value = 1;' }],
+        structured_review: {
+          ...structuredReviewContext(),
+          omitted_material: ''
+        }
+      }),
+      /omitted_material/
+    );
+  } finally {
+    config.requireStructuredReviewContext = previous;
+  }
+});
+
+test('enforced structured review context preserves validated fields', () => {
+  const previous = config.requireStructuredReviewContext;
+  config.requireStructuredReviewContext = true;
+  try {
+    const structured = structuredReviewContext();
+    const validation = validateCouncilContext({
+      files: [{ path: 'virtual.ts', content: 'export const value = 1;' }],
+      structured_review: structured
+    });
+
+    assert.deepEqual(validation.structured_review, structured);
+  } finally {
+    config.requireStructuredReviewContext = previous;
+  }
 });

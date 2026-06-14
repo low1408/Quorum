@@ -110,6 +110,86 @@ test('runCouncilConsultation bounds provider concurrency', async () => {
   assert.equal(maxActive, 2);
 });
 
+test('runCouncilConsultation uses a fresh tab for same-provider consolidation', async () => {
+  initSchema();
+  const context = validateCouncilContext({
+    files: [{ path: 'virtual.ts', content: 'export const value = 1;' }]
+  }, 'Review this file.');
+
+  const fakeBrowser = { close: async () => {} } as any;
+  const fakeContext = { close: async () => {} } as any;
+  const fakeAnalysisPage = {
+    isClosed: () => false,
+    close: async () => {}
+  } as any;
+
+  let analysisPoolItem: any;
+  let consolidationPoolItem: any;
+  let consolidationSnapshot: any;
+  let analysisPageAtSetup: any;
+  const originalConsolidatorProvider = process.env.COUNCIL_CONSOLIDATOR_PROVIDER;
+  process.env.COUNCIL_CONSOLIDATOR_PROVIDER = 'chatgpt';
+  const runnerFactory: CouncilRunnerFactory = ({ runId, taskId, provider }) => ({
+    async executeTask(prompt, poolItem, options) {
+      getDB().prepare(`
+        INSERT INTO Tasks (task_id, run_id, provider_name, prompt_payload, status, attempt_no)
+        VALUES (?, ?, ?, ?, 'IN_PROGRESS', ?)
+      `).run(taskId, runId, provider, prompt, options?.attemptNo ?? 1);
+
+      if (taskId.includes('consolidation')) {
+        consolidationPoolItem = poolItem;
+        consolidationSnapshot = {
+          browser: poolItem?.browser,
+          context: poolItem?.context,
+          page: poolItem?.page
+        };
+      } else if (provider === 'chatgpt') {
+        analysisPoolItem = poolItem;
+        poolItem!.browser = fakeBrowser;
+        poolItem!.context = fakeContext;
+        poolItem!.page = fakeAnalysisPage;
+        poolItem!.ownsBrowser = true;
+        poolItem!.ownsContext = true;
+        poolItem!.ownsPage = true;
+        analysisPageAtSetup = poolItem!.page;
+      }
+
+      const response = taskId.includes('consolidation') ? 'consolidated report' : `analysis from ${provider}`;
+      getDB().prepare(`
+        UPDATE Tasks
+        SET response_text = ?, extraction_method = 'api', status = 'COMPLETED'
+        WHERE task_id = ?
+      `).run(response, taskId);
+      return response;
+    },
+    async close() {}
+  });
+
+  let result;
+  try {
+    result = await runCouncilConsultation({
+      question: 'Review this file.',
+      context,
+      providers: ['chatgpt'],
+      maxRetries: 0,
+      runnerFactory
+    });
+  } finally {
+    if (originalConsolidatorProvider === undefined) {
+      delete process.env.COUNCIL_CONSOLIDATOR_PROVIDER;
+    } else {
+      process.env.COUNCIL_CONSOLIDATOR_PROVIDER = originalConsolidatorProvider;
+    }
+  }
+
+  assert.equal(result.status, 'COMPLETED');
+  assert.notEqual(consolidationPoolItem, analysisPoolItem);
+  assert.equal(consolidationSnapshot.browser, fakeBrowser);
+  assert.equal(consolidationSnapshot.context, fakeContext);
+  assert.equal(consolidationSnapshot.page, null);
+  assert.equal(analysisPageAtSetup, fakeAnalysisPage);
+});
+
 test('runCouncilConsultation retries classified transient pre-dispatch failures', async () => {
   initSchema();
   const context = validateCouncilContext({
