@@ -33,7 +33,9 @@ test('rejects malformed, duplicate, empty, oversized, binary, secret, and stale 
   assert.throws(() => validateCouncilContext({ files: [{ path: 'a.ts', content: '   ' }] }), /empty/);
   assert.throws(() => validateCouncilContext({ files: [{ path: 'a.ts', content: 'x'.repeat(250_001) }] }), /exceeds/);
   assert.throws(() => validateCouncilContext({ files: [{ path: 'a.bin', content: 'abc\0def' }] }), /binary/);
-  assert.throws(() => validateCouncilContext({ files: [{ path: 'a.env', content: 'API_KEY=abcdefghijklmnopqrstuvwxyz123456' }] }), /secret/);
+  assert.throws(() => validateCouncilContext({ files: [{ path: 'a.env', content: 'API_KEY=' + 'sk-' + 'live_12345678901234567890' }] }), /secret/);
+  const validationWithRedacted = validateCouncilContext({ files: [{ path: 'a.env', content: 'API_KEY=[REDACTED]' }] });
+  assert.ok(validationWithRedacted);
   assert.throws(() => validateCouncilContext({ files: [{ path: 'a.ts', content: 'x', sha256: digest('y') }] }), /stale|incorrect/);
 });
 
@@ -63,7 +65,7 @@ test('rejects unknown fields, unsafe request text, unsafe metadata, and sensitiv
     /relevance.*binary/
   );
   assert.throws(
-    () => validateCouncilRequestText('Review this.', 'API_KEY=abcdefghijklmnopqrstuvwxyz123456'),
+    () => validateCouncilRequestText('Review this.', 'API_KEY=' + 'abcdefghijklmnopqrstuvwxyz123456'),
     /Constraints.*secret/
   );
 
