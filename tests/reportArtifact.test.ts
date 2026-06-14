@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
+import path from 'node:path';
 import test from 'node:test';
 import { saveCouncilReportArtifact } from '../from_orchestrator/mcp/reportArtifact.ts';
+
+const repositoryRoot = process.cwd();
 
 async function snapshotFile(filePath: string): Promise<string | null> {
   return await fs.readFile(filePath, 'utf8').catch((err: NodeJS.ErrnoException) => {
@@ -22,13 +25,16 @@ test('saveCouncilReportArtifact writes direct quorum folder with individual memb
   const runId = 'council_run_test:unsafe/id';
   const safeRunId = 'council_run_test_unsafe_id';
   const outputPaths = [
-    'quorum/council_report.md',
-    `quorum/test-chatgpt_${safeRunId}.md`,
-    `quorum/test-gemini_${safeRunId}.md`
+    path.join(repositoryRoot, 'quorum/council_report.md'),
+    path.join(repositoryRoot, `quorum/test-chatgpt_${safeRunId}.md`),
+    path.join(repositoryRoot, `quorum/test-gemini_${safeRunId}.md`)
   ];
   const snapshots = await Promise.all(outputPaths.map(snapshotFile));
+  const originalCwd = process.cwd();
 
   try {
+    process.chdir('/tmp');
+
     const artifact = await saveCouncilReportArtifact({
       run_id: runId,
       status: 'COMPLETED',
@@ -42,6 +48,7 @@ test('saveCouncilReportArtifact writes direct quorum folder with individual memb
 
     // Combined report lives in the local quorum folder
     assert.equal(artifact.relativePath, 'quorum/council_report.md');
+    assert.equal(artifact.absolutePath, path.join(repositoryRoot, 'quorum/council_report.md'));
 
     const markdown = await fs.readFile(artifact.absolutePath, 'utf8');
     assert.match(markdown, /^# Council Report/);
@@ -52,8 +59,10 @@ test('saveCouncilReportArtifact writes direct quorum folder with individual memb
     assert.equal(artifact.memberPaths.length, 2);
     assert.equal(artifact.memberPaths[0].provider, 'test-chatgpt');
     assert.equal(artifact.memberPaths[0].relativePath, `quorum/test-chatgpt_${safeRunId}.md`);
+    assert.equal(artifact.memberPaths[0].absolutePath, path.join(repositoryRoot, `quorum/test-chatgpt_${safeRunId}.md`));
     assert.equal(artifact.memberPaths[1].provider, 'test-gemini');
     assert.equal(artifact.memberPaths[1].relativePath, `quorum/test-gemini_${safeRunId}.md`);
+    assert.equal(artifact.memberPaths[1].absolutePath, path.join(repositoryRoot, `quorum/test-gemini_${safeRunId}.md`));
 
     const chatgptMd = await fs.readFile(artifact.memberPaths[0].absolutePath, 'utf8');
     assert.match(chatgptMd, /# Council Member Report — test-chatgpt/);
@@ -63,13 +72,14 @@ test('saveCouncilReportArtifact writes direct quorum folder with individual memb
     assert.match(geminiMd, /# Council Member Report — test-gemini/);
     assert.match(geminiMd, /Gemini says: use option B\./);
   } finally {
+    process.chdir(originalCwd);
     await Promise.all(outputPaths.map((filePath, index) => restoreFile(filePath, snapshots[index])));
   }
 });
 
 test('saveCouncilReportArtifact handles empty analyses array gracefully', async () => {
   const runId = 'council_run_empty_analyses';
-  const reportPath = 'quorum/council_report.md';
+  const reportPath = path.join(repositoryRoot, 'quorum/council_report.md');
   const snapshot = await snapshotFile(reportPath);
 
   try {

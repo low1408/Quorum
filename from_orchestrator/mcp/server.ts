@@ -91,14 +91,16 @@ server.registerTool(
       console.error(`[INFO] Council run saved to ${artifact.relativePath}\n${memberList}`);
     }
 
+    const response = artifact ? { ...result, artifact } : result;
+
     return {
       content: [
         {
           type: 'text',
-          text: JSON.stringify(result, null, 2)
+          text: JSON.stringify(response, null, 2)
         }
       ],
-      structuredContent: result
+      structuredContent: response
     };
   }
 );
