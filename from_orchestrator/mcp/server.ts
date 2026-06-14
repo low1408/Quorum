@@ -7,6 +7,7 @@ import { initSchema } from '../db/database.ts';
 import { runCouncilConsultation } from '../engine/council.ts';
 import { validateCouncilContext } from './contextValidation.ts';
 import { SUPPORTED_PROVIDER_IDS, validateProviderList } from '../adapters/registry.ts';
+import { saveCouncilReportArtifact } from './reportArtifact.ts';
 
 const contextFileSchema = z.object({
   path: z.string(),
@@ -79,6 +80,16 @@ server.registerTool(
       maxConcurrency: args.max_concurrency,
       maxRetries: args.max_retries
     });
+
+    const artifact = await saveCouncilReportArtifact(result).catch((err) => {
+      console.error('[WARN] Failed to save council report artifact:', err?.message ?? err);
+      return null;
+    });
+
+    if (artifact) {
+      const memberList = artifact.memberPaths.map(m => `  - ${m.provider}: ${m.relativePath}`).join('\n');
+      console.error(`[INFO] Council run saved to ${artifact.relativePath}\n${memberList}`);
+    }
 
     return {
       content: [

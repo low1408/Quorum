@@ -25,9 +25,10 @@ export type CouncilConsultationResult = {
   status: 'COMPLETED' | 'PARTIAL_SUCCESS';
   report: string;
   warnings: string[];
+  analyses: CouncilAnalysis[];
 };
 
-type CouncilAnalysis = {
+export type CouncilAnalysis = {
   provider: string;
   taskId: string;
   response: string;
@@ -367,7 +368,8 @@ async function runCouncilConsultationInner(request: CouncilConsultationRequest, 
       run_id: runId,
       status,
       report,
-      warnings: Array.from(new Set(warnings))
+      warnings: Array.from(new Set(warnings)),
+      analyses
     };
   } finally {
     // Keep browser sessions open after council consultation finished as requested by the user

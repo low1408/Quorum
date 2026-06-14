@@ -493,10 +493,16 @@ async function runCouncilDebateInner(
   const status = completedAllInitial ? 'COMPLETED' : 'PARTIAL_SUCCESS';
   DBService.updateRunStatusIfNotTerminal(runId, status);
 
+  // Build per-provider analyses from the final decision-round turns for artifact saving
+  const analyses = turns
+    .filter(t => t.phase === 'decision')
+    .map(t => ({ provider: t.provider, taskId: t.taskId, response: t.response }));
+
   return {
     run_id: runId,
     status,
     report,
-    warnings: Array.from(new Set(warnings))
+    warnings: Array.from(new Set(warnings)),
+    analyses
   };
 }
