@@ -1,9 +1,10 @@
 import crypto from 'node:crypto';
 import { DBService } from '../db/database.ts';
 import { OrchestrationRunner } from './runner.ts';
-import type { CouncilRunner } from './runner.ts';
+
 import { validateCouncilRequestText } from '../mcp/contextValidation.ts';
-import type { ValidatedCouncilContext, CouncilConsultationRequest, CouncilConsultationResult } from '../mcp/contextValidation.ts';
+import type { ValidatedCouncilContext } from '../mcp/contextValidation.ts';
+import type { CouncilConsultationRequest, CouncilConsultationResult } from './council.ts';
 import { validateProviderList, normalizeProviderId } from '../adapters/registry.ts';
 import { closeSessionItem, ProviderSessionPool } from './providerSessionPool.ts';
 import { createCancelledError, isAbortError } from './statuses.ts';
