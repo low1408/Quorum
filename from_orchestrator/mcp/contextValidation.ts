@@ -9,19 +9,56 @@ export type CouncilContextFile = {
   sha256?: string;
   modified_at?: string;
   relevance?: string;
+  start_line?: number;
+  end_line?: number;
+  total_lines?: number;
+  is_excerpt?: boolean;
 };
 
 export type CouncilContext = {
+  schema_version?: string;
   files: CouncilContextFile[];
   notes?: string;
+  evidence_manifest?: CouncilEvidenceManifestItem[];
   structured_review?: CouncilStructuredReviewContext;
 };
 
 export type ValidatedCouncilContext = {
-  files: Array<CouncilContextFile & { normalizedPath: string; computedSha256: string }>;
+  schema_version?: string;
+  files: Array<CouncilContextFile & {
+    normalizedPath: string;
+    computedSha256: string;
+    evidenceId: string;
+    role: CouncilEvidenceRole;
+    provenance: CouncilEvidenceProvenance;
+    order?: number;
+    startLine: number;
+    endLine: number;
+    totalLines: number;
+    isExcerpt: boolean;
+  }>;
   notes?: string;
+  evidence_manifest?: CouncilEvidenceManifestItem[];
   structured_review?: CouncilStructuredReviewContext;
   warnings: string[];
+  context_digest: string;
+};
+
+export type CouncilEvidenceRole = 'core' | 'contract' | 'config' | 'test' | 'runtime' | 'supporting';
+export type CouncilEvidenceProvenance = 'repository' | 'generated' | 'test-runtime' | 'caller-supplied';
+
+export type CouncilEvidenceManifestItem = {
+  id: string;
+  path: string;
+  sha256?: string;
+  role: CouncilEvidenceRole;
+  provenance: CouncilEvidenceProvenance;
+  relevance: string;
+  order?: number;
+  start_line?: number;
+  end_line?: number;
+  total_lines?: number;
+  is_excerpt?: boolean;
 };
 
 export type CouncilStructuredReviewContext = {
@@ -55,8 +92,33 @@ const SECRET_PATTERNS = [
   /\b(?:api[_-]?key|secret|token|password|passwd|credential)\b\s*[:=]\s*["']?[A-Za-z0-9_./+=-]{16,}/i,
   /\bAWS_SECRET_ACCESS_KEY\b\s*[:=]\s*["']?[A-Za-z0-9/+=]{30,}/i
 ];
-const CONTEXT_KEYS = new Set(['files', 'notes', 'structured_review']);
-const CONTEXT_FILE_KEYS = new Set(['path', 'content', 'sha256', 'modified_at', 'relevance']);
+const CONTEXT_KEYS = new Set(['schema_version', 'files', 'notes', 'evidence_manifest', 'structured_review']);
+const CONTEXT_FILE_KEYS = new Set([
+  'path',
+  'content',
+  'sha256',
+  'modified_at',
+  'relevance',
+  'start_line',
+  'end_line',
+  'total_lines',
+  'is_excerpt'
+]);
+const EVIDENCE_MANIFEST_KEYS = new Set([
+  'id',
+  'path',
+  'sha256',
+  'role',
+  'provenance',
+  'relevance',
+  'order',
+  'start_line',
+  'end_line',
+  'total_lines',
+  'is_excerpt'
+]);
+const EVIDENCE_ROLES = new Set<CouncilEvidenceRole>(['core', 'contract', 'config', 'test', 'runtime', 'supporting']);
+const EVIDENCE_PROVENANCE = new Set<CouncilEvidenceProvenance>(['repository', 'generated', 'test-runtime', 'caller-supplied']);
 const TEXT_FIELD_MAX_CHARS = 50_000;
 
 function normalizeContextPath(rawPath: string): string {
@@ -138,6 +200,28 @@ function validateTextField(value: unknown, label: string, options: {
   return value;
 }
 
+function validateOptionalInteger(value: unknown, label: string, options: {
+  min?: number;
+} = {}): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!Number.isInteger(value)) {
+    throw new Error(`${label} must be an integer.`);
+  }
+  const numberValue = value as number;
+  if (options.min !== undefined && numberValue < options.min) {
+    throw new Error(`${label} must be at least ${options.min}.`);
+  }
+  return numberValue;
+}
+
+function validateOptionalBoolean(value: unknown, label: string): boolean | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'boolean') {
+    throw new Error(`${label} must be a boolean.`);
+  }
+  return value;
+}
+
 function assertSafeContextPath(normalizedPath: string): void {
   const lower = normalizedPath.toLowerCase();
   const basename = path.posix.basename(lower);
@@ -197,6 +281,90 @@ function validateStructuredReviewContext(context: CouncilContext, warnings: stri
 
 function referencedRepositoryPaths(text: string): string[] {
   return text.match(/[A-Za-z0-9_./-]+\.(?:ts|tsx|js|jsx|json|md|yml|yaml)/g) || [];
+}
+
+function validateEvidenceManifest(context: CouncilContext): Map<string, CouncilEvidenceManifestItem> {
+  const manifest = context.evidence_manifest;
+  if (manifest === undefined) return new Map();
+  if (!Array.isArray(manifest)) {
+    throw new Error('Evidence manifest must be an array.');
+  }
+
+  const byPath = new Map<string, CouncilEvidenceManifestItem>();
+  const seenIds = new Set<string>();
+  for (const item of manifest) {
+    if (!item || typeof item !== 'object') {
+      throw new Error('Evidence manifest item must be an object.');
+    }
+    assertNoUnknownKeys(item as unknown as Record<string, unknown>, EVIDENCE_MANIFEST_KEYS, 'Evidence manifest item');
+    const id = validateTextField(item.id, 'Evidence manifest item id', { required: true, maxChars: 120 })!;
+    if (!/^[A-Za-z0-9_.:-]+$/.test(id)) {
+      throw new Error(`Evidence manifest item id contains unsupported characters: ${id}`);
+    }
+    if (seenIds.has(id)) {
+      throw new Error(`Duplicate evidence manifest id: ${id}`);
+    }
+    seenIds.add(id);
+
+    const normalizedPath = normalizeContextPath(validateTextField(item.path, `Evidence manifest item ${id} path`, { required: true, maxChars: 2_000 })!);
+    assertSafeContextPath(normalizedPath);
+    if (!EVIDENCE_ROLES.has(item.role)) {
+      throw new Error(`Evidence manifest item ${id} has invalid role: ${String(item.role)}`);
+    }
+    if (!EVIDENCE_PROVENANCE.has(item.provenance)) {
+      throw new Error(`Evidence manifest item ${id} has invalid provenance: ${String(item.provenance)}`);
+    }
+    validateTextField(item.relevance, `Evidence manifest item ${id} relevance`, { required: true, maxChars: 2_000 });
+    validateTextField(item.sha256, `Evidence manifest item ${id} sha256`, { maxChars: 128 });
+    validateOptionalInteger(item.order, `Evidence manifest item ${id} order`);
+    validateOptionalInteger(item.start_line, `Evidence manifest item ${id} start_line`, { min: 1 });
+    validateOptionalInteger(item.end_line, `Evidence manifest item ${id} end_line`, { min: 1 });
+    validateOptionalInteger(item.total_lines, `Evidence manifest item ${id} total_lines`, { min: 1 });
+    validateOptionalBoolean(item.is_excerpt, `Evidence manifest item ${id} is_excerpt`);
+    if (item.start_line !== undefined && item.end_line !== undefined && item.end_line < item.start_line) {
+      throw new Error(`Evidence manifest item ${id} has end_line before start_line.`);
+    }
+    if (byPath.has(normalizedPath)) {
+      throw new Error(`Duplicate evidence manifest path: ${normalizedPath}`);
+    }
+    byPath.set(normalizedPath, { ...item, path: normalizedPath });
+  }
+
+  return byPath;
+}
+
+function lineCount(content: string): number {
+  if (content.length === 0) return 0;
+  return content.split(/\r?\n/u).length;
+}
+
+function contextDigest(params: {
+  question: string;
+  schemaVersion?: string;
+  files: ValidatedCouncilContext['files'];
+  structuredReview?: CouncilStructuredReviewContext;
+  notes?: string;
+}): string {
+  const payload = {
+    question: params.question,
+    schema_version: params.schemaVersion || null,
+    notes: params.notes || null,
+    structured_review: params.structuredReview || null,
+    files: params.files.map(file => ({
+      id: file.evidenceId,
+      path: file.normalizedPath,
+      sha256: file.computedSha256,
+      role: file.role,
+      provenance: file.provenance,
+      relevance: file.relevance || null,
+      order: file.order ?? null,
+      start_line: file.startLine,
+      end_line: file.endLine,
+      total_lines: file.totalLines,
+      is_excerpt: file.isExcerpt
+    }))
+  };
+  return sha256(JSON.stringify(payload));
 }
 
 function candidateImportPaths(content: string): string[] {
@@ -303,11 +471,15 @@ export function validateCouncilContext(context: CouncilContext, question = ''): 
   if (context.files.length === 0) {
     throw new Error('Context must include at least one file.');
   }
+  validateTextField(context.schema_version, 'Context schema_version', { maxChars: 40 });
   validateTextField(context.notes, 'Context notes');
 
   const seen = new Set<string>();
+  const contentHashes = new Map<string, string>();
   const warnings: string[] = [];
   const structuredReview = validateStructuredReviewContext(context, warnings);
+  const manifestByPath = validateEvidenceManifest(context);
+  const unresolvedManifestPaths = new Set(manifestByPath.keys());
   const files: ValidatedCouncilContext['files'] = [];
   let totalChars = structuredReview
     ? STRUCTURED_REVIEW_FIELDS.reduce((sum, field) => sum + structuredReview[field].length, 0)
@@ -329,6 +501,12 @@ export function validateCouncilContext(context: CouncilContext, question = ''): 
     }
     seen.add(normalizedPath);
     validateTextField(file.relevance, `Context file relevance for ${normalizedPath}`, { maxChars: 2_000 });
+    const manifestItem = manifestByPath.get(normalizedPath);
+    unresolvedManifestPaths.delete(normalizedPath);
+    const startLine = validateOptionalInteger(file.start_line, `Context file start_line for ${normalizedPath}`, { min: 1 }) ?? manifestItem?.start_line ?? 1;
+    const declaredEndLine = validateOptionalInteger(file.end_line, `Context file end_line for ${normalizedPath}`, { min: 1 }) ?? manifestItem?.end_line;
+    const declaredTotalLines = validateOptionalInteger(file.total_lines, `Context file total_lines for ${normalizedPath}`, { min: 1 }) ?? manifestItem?.total_lines;
+    const declaredExcerpt = validateOptionalBoolean(file.is_excerpt, `Context file is_excerpt for ${normalizedPath}`);
 
     if (typeof file.content !== 'string' || file.content.trim() === '') {
       throw new Error(`Context file is empty: ${normalizedPath}`);
@@ -349,6 +527,12 @@ export function validateCouncilContext(context: CouncilContext, question = ''): 
     }
 
     const computedSha256 = sha256(file.content);
+    const previousPathForHash = contentHashes.get(computedSha256);
+    if (previousPathForHash) {
+      warnings.push(`Context includes duplicate content hash for ${previousPathForHash} and ${normalizedPath}.`);
+    } else {
+      contentHashes.set(computedSha256, normalizedPath);
+    }
     if (file.sha256 && file.sha256.toLowerCase() !== computedSha256) {
       throw new Error(`Context file hash is stale or incorrect: ${normalizedPath}`);
     }
@@ -373,16 +557,75 @@ export function validateCouncilContext(context: CouncilContext, question = ''): 
       warnings.push(`Context file does not exist on disk and could not be freshness-checked: ${normalizedPath}.`);
     }
 
-    files.push({ ...file, normalizedPath, computedSha256 });
+    if (manifestItem?.sha256 && manifestItem.sha256.toLowerCase() !== computedSha256) {
+      throw new Error(`Evidence manifest hash is stale or incorrect: ${manifestItem.id}`);
+    }
+
+    const contentLineCount = lineCount(file.content);
+    const endLine = declaredEndLine ?? (startLine + contentLineCount - 1);
+    const totalLines = declaredTotalLines ?? Math.max(endLine, contentLineCount);
+    const isExcerpt = declaredExcerpt ?? manifestItem?.is_excerpt ?? (startLine !== 1 || endLine < totalLines);
+    if (endLine < startLine) {
+      throw new Error(`Context file end_line is before start_line: ${normalizedPath}`);
+    }
+    if (totalLines < endLine) {
+      throw new Error(`Context file total_lines is before end_line: ${normalizedPath}`);
+    }
+    if (manifestItem?.start_line !== undefined && manifestItem.start_line !== startLine) {
+      throw new Error(`Evidence manifest start_line does not match file metadata: ${manifestItem.id}`);
+    }
+    if (manifestItem?.end_line !== undefined && manifestItem.end_line !== endLine) {
+      throw new Error(`Evidence manifest end_line does not match file metadata: ${manifestItem.id}`);
+    }
+    if (manifestItem?.total_lines !== undefined && manifestItem.total_lines !== totalLines) {
+      throw new Error(`Evidence manifest total_lines does not match file metadata: ${manifestItem.id}`);
+    }
+
+    files.push({
+      ...file,
+      normalizedPath,
+      computedSha256,
+      evidenceId: manifestItem?.id || normalizedPath,
+      role: manifestItem?.role || 'core',
+      provenance: manifestItem?.provenance || 'repository',
+      relevance: manifestItem?.relevance || file.relevance,
+      order: manifestItem?.order,
+      startLine,
+      endLine,
+      totalLines,
+      isExcerpt
+    });
   }
+
+  if (unresolvedManifestPaths.size > 0) {
+    throw new Error(`Evidence manifest references missing context file(s): ${Array.from(unresolvedManifestPaths).join(', ')}.`);
+  }
+
+  files.sort((a, b) => {
+    const orderA = a.order ?? Number.MAX_SAFE_INTEGER;
+    const orderB = b.order ?? Number.MAX_SAFE_INTEGER;
+    if (orderA !== orderB) return orderA - orderB;
+    if (a.role !== b.role) return a.role.localeCompare(b.role);
+    return a.normalizedPath.localeCompare(b.normalizedPath);
+  });
 
   addCompletenessWarnings(files, `${question}\n${context.notes || ''}`, warnings);
   addStructuredContextWarnings(structuredReview, files, warnings);
+  const dedupedWarnings = Array.from(new Set(warnings));
 
   return {
+    schema_version: context.schema_version,
     files,
     notes: context.notes,
+    evidence_manifest: context.evidence_manifest,
     structured_review: structuredReview,
-    warnings: Array.from(new Set(warnings))
+    warnings: dedupedWarnings,
+    context_digest: contextDigest({
+      question,
+      schemaVersion: context.schema_version,
+      files,
+      structuredReview,
+      notes: context.notes
+    })
   };
 }

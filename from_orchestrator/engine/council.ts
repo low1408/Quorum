@@ -117,13 +117,18 @@ function renderContextWarnings(warnings: string[]): string {
 function renderRepositoryEvidence(context: ValidatedCouncilContext): string {
   return context.files.map((file, index) => {
     const sourceNo = index + 1;
-    const content = lineNumberContent(file.content);
+    const content = lineNumberContent(file.content, file.startLine);
     return [
       `<<<SOURCE ${sourceNo}`,
+      `id=${file.evidenceId}`,
       `path=${file.normalizedPath}`,
       `sha256=${file.computedSha256}`,
+      `role=${file.role}`,
+      `provenance=${file.provenance}`,
       `relevance=${file.relevance || 'unspecified'}`,
-      `start_line=1`,
+      `range=${file.startLine}-${file.endLine}`,
+      `total_lines=${file.totalLines}`,
+      `excerpt=${file.isExcerpt}`,
       `length_chars=${file.content.length}`,
       '>>>',
       content,
@@ -184,6 +189,7 @@ export function buildCouncilAnalysisPrompt(params: {
     params.constraints ? `CONSTRAINTS:\n${params.constraints}` : '',
     params.context.notes ? `CALLER CONTEXT NOTES:\n${params.context.notes}` : '',
     structured ? `STRUCTURED REVIEW CONTEXT:\n${structured}` : '',
+    `CONTEXT DIGEST:\n${params.context.context_digest}`,
     warnings,
     `REPOSITORY EVIDENCE:\n${repositoryEvidence}`
   ].filter(Boolean).join('\n\n');
@@ -211,6 +217,7 @@ export function buildCouncilConsolidationPrompt(params: {
     '',
     `QUESTION:\n${params.question}`,
     params.constraints ? `CONSTRAINTS:\n${params.constraints}` : '',
+    params.context ? `CONTEXT DIGEST:\n${params.context.context_digest}` : '',
     warnings,
     repositoryEvidence ? `REPOSITORY EVIDENCE FOR VERIFICATION:\n${repositoryEvidence}` : '',
     `INDEPENDENT ANALYSES:\n${analysisBlocks}`

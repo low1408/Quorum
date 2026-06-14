@@ -112,6 +112,119 @@ test('warns when structured review paths contradict supplied files', () => {
   assert.match(validation.warnings.join('\n'), /omitted_material says tests\/council\.test\.ts is omitted/);
 });
 
+test('validates evidence manifests, excerpt metadata, ordering, duplicate hashes, and context digest', () => {
+  const firstContent = 'export const first = 1;';
+  const duplicateContent = 'export const duplicate = true;';
+  const validation = validateCouncilContext({
+    schema_version: '2026-06-14',
+    files: [
+      {
+        path: 'b.ts',
+        content: duplicateContent,
+        sha256: digest(duplicateContent)
+      },
+      {
+        path: 'a.ts',
+        content: firstContent,
+        sha256: digest(firstContent),
+        start_line: 10,
+        end_line: 10,
+        total_lines: 20,
+        is_excerpt: true
+      },
+      {
+        path: 'c.ts',
+        content: duplicateContent,
+        sha256: digest(duplicateContent)
+      }
+    ],
+    evidence_manifest: [
+      {
+        id: 'EV2',
+        path: 'b.ts',
+        sha256: digest(duplicateContent),
+        role: 'test',
+        provenance: 'repository',
+        relevance: 'second',
+        order: 2
+      },
+      {
+        id: 'EV1',
+        path: 'a.ts',
+        sha256: digest(firstContent),
+        role: 'core',
+        provenance: 'repository',
+        relevance: 'first',
+        order: 1,
+        start_line: 10,
+        end_line: 10,
+        total_lines: 20,
+        is_excerpt: true
+      },
+      {
+        id: 'EV3',
+        path: 'c.ts',
+        sha256: digest(duplicateContent),
+        role: 'supporting',
+        provenance: 'generated',
+        relevance: 'third',
+        order: 3
+      }
+    ]
+  }, 'Review this file.');
+
+  assert.deepEqual(validation.files.map(file => file.evidenceId), ['EV1', 'EV2', 'EV3']);
+  assert.equal(validation.files[0].startLine, 10);
+  assert.equal(validation.files[0].endLine, 10);
+  assert.equal(validation.files[0].totalLines, 20);
+  assert.equal(validation.files[0].isExcerpt, true);
+  assert.equal(validation.files[2].provenance, 'generated');
+  assert.match(validation.warnings.join('\n'), /duplicate content hash/);
+  assert.match(validation.context_digest, /^[a-f0-9]{64}$/);
+
+  const changedQuestion = validateCouncilContext({
+    files: [{ path: 'a.ts', content: firstContent, sha256: digest(firstContent) }]
+  }, 'Review another file.');
+  assert.notEqual(validation.context_digest, changedQuestion.context_digest);
+});
+
+test('rejects malformed evidence manifests', () => {
+  assert.throws(
+    () => validateCouncilContext({
+      files: [{ path: 'a.ts', content: 'export const value = 1;' }],
+      evidence_manifest: [{
+        id: 'EV1',
+        path: 'missing.ts',
+        role: 'core',
+        provenance: 'repository',
+        relevance: 'missing'
+      }]
+    }),
+    /missing context file/
+  );
+
+  assert.throws(
+    () => validateCouncilContext({
+      files: [{ path: 'a.ts', content: 'export const value = 1;' }],
+      evidence_manifest: [{
+        id: 'EV1',
+        path: 'a.ts',
+        role: 'invalid',
+        provenance: 'repository',
+        relevance: 'bad role'
+      } as any]
+    }),
+    /invalid role/
+  );
+
+  assert.throws(
+    () => validateCouncilContext({
+      files: [{ path: 'a.ts', content: 'export const value = 1;', start_line: 5, end_line: 4 }]
+    }),
+    /end_line is before start_line/
+  );
+});
+
 test('structured review context is optional unless enforcement is enabled', () => {
   const previous = config.requireStructuredReviewContext;
   config.requireStructuredReviewContext = false;
