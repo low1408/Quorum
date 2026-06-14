@@ -49,7 +49,7 @@ export type CouncilRunnerFactory = (params: {
   provider: string;
 }) => CouncilRunner;
 
-const DEFAULT_PROVIDERS = (process.env.COUNCIL_PROVIDERS || 'chatgpt,gemini,meta,kimi,claude')
+const DEFAULT_PROVIDERS = (process.env.COUNCIL_PROVIDERS || 'chatgpt,gemini,meta,kimi')
   .split(',')
   .map(provider => provider.trim())
   .filter(Boolean);
@@ -267,8 +267,8 @@ async function runProviderWithTimeout(params: {
     return { provider, taskId, response };
   } catch (err) {
     controller.abort(createCancelledError(`${provider} failed.`));
-    await runner.close().catch(() => {});
-    await pool.invalidate(provider, err instanceof Error ? err.message : String(err)).catch(() => {});
+    await runner.close().catch(() => { });
+    await pool.invalidate(provider, err instanceof Error ? err.message : String(err)).catch(() => { });
     throw err;
   }
 }
