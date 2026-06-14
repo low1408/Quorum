@@ -92,7 +92,6 @@ server.registerTool(
   }
 );
 
-
 async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   const shutdown = async (signal: string) => {
