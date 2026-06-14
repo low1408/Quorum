@@ -134,6 +134,41 @@ export class OrchestrationRunner {
     this.stateStartTime = now;
   }
 
+  private async persistExtractedResponse(
+    markdown: string,
+    extractionMethod: 'clean' | 'timeout_forced' | 'manual' | 'api'
+  ): Promise<void> {
+    DBService.updateTaskResponse({
+      taskId: this.taskId,
+      responseText: markdown,
+      extractionMethod,
+      status: 'COMPLETED',
+    });
+    if (this.manageRunStatus) {
+      DBService.updateRunStatus(this.runId, 'COMPLETED');
+    }
+  }
+
+  private async forceExtractAfterCompletionFailure(page: any, error: any): Promise<string | null> {
+    console.warn(`[WARNING] Completion wait failed for ${this.taskId}: ${error?.message || String(error)}`);
+    console.warn('[WARNING] Attempting forced extraction before failing the task...');
+
+    try {
+      this.transitionTo('EXTRACTING');
+      const markdown = await this.adapter.extractAndNormalizeAST(page);
+      if (!markdown || !markdown.trim()) {
+        return null;
+      }
+
+      await this.persistExtractedResponse(markdown, 'timeout_forced');
+      this.transitionTo('COMPLETE');
+      return markdown;
+    } catch (extractErr: any) {
+      console.warn(`[WARNING] Forced extraction failed for ${this.taskId}: ${extractErr?.message || String(extractErr)}`);
+      return null;
+    }
+  }
+
   /**
    * Executes a prompt task end-to-end through the state machine.
    */
@@ -360,15 +395,7 @@ export class OrchestrationRunner {
         }
 
         // Save Response & transition to complete
-        DBService.updateTaskResponse({
-          taskId: this.taskId,
-          responseText: markdown,
-          extractionMethod: 'clean',
-          status: 'COMPLETED',
-        });
-        if (this.manageRunStatus) {
-          DBService.updateRunStatus(this.runId, 'COMPLETED');
-        }
+        await this.persistExtractedResponse(markdown, 'clean');
         this.transitionTo('COMPLETE');
 
         // Update Session context with latest updates/cookies
@@ -382,7 +409,19 @@ export class OrchestrationRunner {
 
       // Transition to Streaming
       this.transitionTo('STREAMING');
-      await this.adapter.awaitNetworkCompletion(page);
+      try {
+        await this.adapter.awaitNetworkCompletion(page);
+      } catch (completionErr: any) {
+        const forcedMarkdown = await this.forceExtractAfterCompletionFailure(page, completionErr);
+        if (forcedMarkdown) {
+          if (!this.isCdpConnection) {
+            const finalState = await context.storageState();
+            await SessionManager.saveSession(this.adapter.providerId, finalState);
+          }
+          return forcedMarkdown;
+        }
+        throw completionErr;
+      }
 
       // Transition to Stabilizing (Mutation observer style delay)
       this.transitionTo('STABILIZING');
@@ -400,15 +439,7 @@ export class OrchestrationRunner {
       }
 
       // Save Response & transition to complete
-      DBService.updateTaskResponse({
-        taskId: this.taskId,
-        responseText: markdown,
-        extractionMethod: 'clean',
-        status: 'COMPLETED',
-      });
-      if (this.manageRunStatus) {
-        DBService.updateRunStatus(this.runId, 'COMPLETED');
-      }
+      await this.persistExtractedResponse(markdown, 'clean');
       this.transitionTo('COMPLETE');
 
       // Update Session context with latest updates/cookies
@@ -625,15 +656,7 @@ export class OrchestrationRunner {
       }
 
       // Save Response
-      DBService.updateTaskResponse({
-        taskId: this.taskId,
-        responseText: markdown,
-        extractionMethod: 'clean',
-        status: 'COMPLETED',
-      });
-      if (this.manageRunStatus) {
-        DBService.updateRunStatus(this.runId, 'COMPLETED');
-      }
+      await this.persistExtractedResponse(markdown, 'clean');
 
       // Update Session
       if (!this.isCdpConnection) {
