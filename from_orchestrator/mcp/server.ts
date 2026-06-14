@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { initSchema } from '../db/database.ts';
 import { runCouncilConsultation } from '../engine/council.ts';
 import { validateCouncilContext } from './contextValidation.ts';
+import { SUPPORTED_PROVIDER_IDS, validateProviderList } from '../adapters/registry.ts';
 
 const contextFileSchema = z.object({
   path: z.string(),
@@ -20,8 +21,21 @@ const consultCouncilSchema = {
     notes: z.string().optional()
   }),
   constraints: z.string().optional(),
-  providers: z.array(z.string().min(1)).optional(),
-  max_wait_ms: z.number().int().positive().optional()
+  providers: z.array(z.string().min(1)).optional().superRefine((providers, ctx) => {
+    if (!providers) return;
+    try {
+      validateProviderList(providers, 'council providers');
+    } catch (err: any) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: err?.message || `Supported providers: ${SUPPORTED_PROVIDER_IDS.join(', ')}`
+      });
+    }
+  }),
+  max_wait_ms: z.number().int().positive().optional(),
+  provider_timeout_ms: z.number().int().positive().optional(),
+  max_concurrency: z.number().int().positive().optional(),
+  max_retries: z.number().int().min(0).optional()
 };
 
 export const server = new McpServer({
@@ -45,7 +59,10 @@ server.registerTool(
       context: validatedContext,
       constraints: args.constraints,
       providers: args.providers,
-      maxWaitMs: args.max_wait_ms
+      maxWaitMs: args.max_wait_ms,
+      providerTimeoutMs: args.provider_timeout_ms,
+      maxConcurrency: args.max_concurrency,
+      maxRetries: args.max_retries
     });
 
     return {
@@ -62,6 +79,13 @@ server.registerTool(
 
 async function main(): Promise<void> {
   const transport = new StdioServerTransport();
+  const shutdown = async (signal: string) => {
+    console.error(`Received ${signal}; shutting down MCP transport.`);
+    await transport.close().catch(() => {});
+    process.exit(0);
+  };
+  process.once('SIGINT', () => void shutdown('SIGINT'));
+  process.once('SIGTERM', () => void shutdown('SIGTERM'));
   await server.connect(transport);
 }
 

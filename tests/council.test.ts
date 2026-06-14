@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { initSchema } from '../from_orchestrator/db/database.ts';
+import { getDB, initSchema } from '../from_orchestrator/db/database.ts';
 import { buildCouncilConsolidationPrompt, runCouncilConsultation } from '../from_orchestrator/engine/council.ts';
+import type { CouncilRunnerFactory } from '../from_orchestrator/engine/council.ts';
+import { DomainError, classifyFailure } from '../from_orchestrator/engine/failures.ts';
 import { validateCouncilContext } from '../from_orchestrator/mcp/contextValidation.ts';
 
 test('consolidation prompt asks for an anonymous action-oriented report', () => {
@@ -38,4 +40,192 @@ test('runCouncilConsultation completes with the mock adapter', async () => {
   assert.match(result.run_id, /^council_run_/);
   assert.match(result.report, /Mock Response/);
   assert.ok(result.warnings.some(warning => warning.includes('virtual.ts')));
+});
+
+test('runCouncilConsultation rejects unsupported providers before creating a run', async () => {
+  initSchema();
+  const context = validateCouncilContext({
+    files: [{
+      path: 'virtual.ts',
+      content: 'export const value = 1;'
+    }]
+  }, 'Review this file.');
+
+  const before = (getDB().prepare('SELECT COUNT(*) AS count FROM Runs').get() as any).count;
+
+  await assert.rejects(
+    runCouncilConsultation({
+      question: 'Review this file.',
+      context,
+      providers: ['chatgpt', 'chatgpt-typo']
+    }),
+    /Unsupported provider IDs: chatgpt-typo/
+  );
+
+  const after = (getDB().prepare('SELECT COUNT(*) AS count FROM Runs').get() as any).count;
+  assert.equal(after, before);
+});
+
+test('runCouncilConsultation bounds provider concurrency', async () => {
+  initSchema();
+  const context = validateCouncilContext({
+    files: [{ path: 'virtual.ts', content: 'export const value = 1;' }]
+  }, 'Review this file.');
+
+  let active = 0;
+  let maxActive = 0;
+  const runnerFactory: CouncilRunnerFactory = ({ runId, taskId, provider }) => ({
+    async executeTask(prompt, _poolItem, options) {
+      getDB().prepare(`
+        INSERT INTO Tasks (task_id, run_id, provider_name, prompt_payload, status, attempt_no)
+        VALUES (?, ?, ?, ?, 'IN_PROGRESS', ?)
+      `).run(taskId, runId, provider, prompt, options?.attemptNo ?? 1);
+
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise(resolve => setTimeout(resolve, 25));
+      active--;
+
+      const response = `response from ${provider}`;
+      getDB().prepare(`
+        UPDATE Tasks
+        SET response_text = ?, extraction_method = 'api', status = 'COMPLETED'
+        WHERE task_id = ?
+      `).run(response, taskId);
+      return response;
+    },
+    async close() {}
+  });
+
+  const result = await runCouncilConsultation({
+    question: 'Review this file.',
+    context,
+    providers: ['mock', 'chatgpt', 'gemini'],
+    maxConcurrency: 2,
+    maxRetries: 0,
+    runnerFactory
+  });
+
+  assert.equal(result.status, 'COMPLETED');
+  assert.equal(maxActive, 2);
+});
+
+test('runCouncilConsultation retries classified transient pre-dispatch failures', async () => {
+  initSchema();
+  const context = validateCouncilContext({
+    files: [{ path: 'virtual.ts', content: 'export const value = 1;' }]
+  }, 'Review this file.');
+
+  let providerAttempts = 0;
+  const runnerFactory: CouncilRunnerFactory = ({ runId, taskId, provider }) => ({
+    async executeTask(prompt, _poolItem, options) {
+      getDB().prepare(`
+        INSERT INTO Tasks (task_id, run_id, provider_name, prompt_payload, status, attempt_no)
+        VALUES (?, ?, ?, ?, 'IN_PROGRESS', ?)
+      `).run(taskId, runId, provider, prompt, options?.attemptNo ?? 1);
+
+      if (!taskId.includes('consolidation')) {
+        providerAttempts++;
+      }
+
+      if (providerAttempts === 1 && !taskId.includes('consolidation')) {
+        const err = new DomainError({
+          code: 'TIMEOUT',
+          message: 'navigation timed out after 10ms.',
+          stage: 'navigation'
+        });
+        const failure = classifyFailure(err);
+        getDB().prepare(`
+          UPDATE Tasks
+          SET status = 'FAILED', failure_code = ?, submission_confirmed = 0
+          WHERE task_id = ?
+        `).run(failure.code, taskId);
+        throw err;
+      }
+
+      const response = taskId.includes('consolidation') ? 'consolidated report' : 'provider analysis';
+      getDB().prepare(`
+        UPDATE Tasks
+        SET response_text = ?, extraction_method = 'api', status = 'COMPLETED'
+        WHERE task_id = ?
+      `).run(response, taskId);
+      return response;
+    },
+    async close() {}
+  });
+
+  const result = await runCouncilConsultation({
+    question: 'Review this file.',
+    context,
+    providers: ['mock'],
+    maxRetries: 1,
+    runnerFactory
+  });
+
+  assert.equal(result.status, 'COMPLETED');
+  assert.equal(providerAttempts, 2);
+
+  const attempts = getDB().prepare(`
+    SELECT attempt_no, status, failure_code, submission_confirmed
+    FROM Tasks
+    WHERE run_id = ?
+      AND task_id LIKE '%_mock_attempt_%'
+    ORDER BY attempt_no
+  `).all(result.run_id) as any[];
+
+  assert.equal(attempts.length, 2);
+  assert.equal(attempts[0].failure_code, 'TIMEOUT');
+  assert.equal(attempts[0].submission_confirmed, 0);
+  assert.equal(attempts[1].status, 'COMPLETED');
+});
+
+test('runCouncilConsultation does not retry failures after confirmed submission', async () => {
+  initSchema();
+  const context = validateCouncilContext({
+    files: [{ path: 'virtual.ts', content: 'export const value = 1;' }]
+  }, 'Review this file.');
+
+  let providerAttempts = 0;
+  let runId = '';
+  const runnerFactory: CouncilRunnerFactory = ({ runId: currentRunId, taskId, provider }) => ({
+    async executeTask(prompt, _poolItem, options) {
+      runId = currentRunId;
+      providerAttempts++;
+      getDB().prepare(`
+        INSERT INTO Tasks (task_id, run_id, provider_name, prompt_payload, status, attempt_no, submission_confirmed)
+        VALUES (?, ?, ?, ?, 'IN_PROGRESS', ?, 1)
+      `).run(taskId, currentRunId, provider, prompt, options?.attemptNo ?? 1);
+
+      const err = new Error('temporary rate limit after send');
+      (err as any).submissionConfirmed = true;
+      getDB().prepare(`
+        UPDATE Tasks
+        SET status = 'FAILED', failure_code = 'RATE_LIMITED', submission_confirmed = 1
+        WHERE task_id = ?
+      `).run(taskId);
+      throw err;
+    },
+    async close() {}
+  });
+
+  await assert.rejects(
+    runCouncilConsultation({
+      question: 'Review this file.',
+      context,
+      providers: ['mock'],
+      maxRetries: 3,
+      runnerFactory
+    }),
+    /All council members failed/
+  );
+
+  const attempts = getDB().prepare(`
+    SELECT COUNT(*) AS count
+    FROM Tasks
+    WHERE run_id = ?
+      AND task_id LIKE '%_mock_attempt_%'
+  `).get(runId) as any;
+
+  assert.equal(providerAttempts, 1);
+  assert.equal(attempts.count, 1);
 });

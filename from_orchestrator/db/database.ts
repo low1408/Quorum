@@ -1,5 +1,7 @@
 import Database from 'better-sqlite3';
 import { config } from '../config/index.ts';
+import type { RunStatus } from '../engine/statuses.ts';
+import type { FailureCode } from '../engine/failures.ts';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
@@ -193,7 +195,7 @@ function repairAllLegacyForeignKeys(db: any): void {
           run_id TEXT NOT NULL REFERENCES Runs(run_id) ON DELETE CASCADE,
           node_id TEXT NOT NULL,
           iteration_no INTEGER DEFAULT 1,
-          status TEXT NOT NULL CHECK(status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'SKIPPED', 'AWAITING_HUMAN_REVIEW', 'INTERVENTION_REQUIRED')),
+          status TEXT NOT NULL CHECK(status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'SKIPPED', 'CANCELLED', 'AWAITING_HUMAN_REVIEW', 'INTERVENTION_REQUIRED')),
           required_for_run_success INTEGER DEFAULT 1 CHECK(required_for_run_success IN (0, 1)),
           failure_policy TEXT DEFAULT 'fail_run' CHECK(failure_policy IN ('fail_run', 'skip_branch', 'continue_with_warning')),
           input_snapshot_json TEXT,
@@ -214,7 +216,7 @@ function repairAllLegacyForeignKeys(db: any): void {
           provider_name TEXT NOT NULL,
           prompt_payload TEXT NOT NULL,
           response_text TEXT,
-          status TEXT NOT NULL CHECK(status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'INTERVENTION_REQUIRED')),
+          status TEXT NOT NULL CHECK(status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED', 'INTERVENTION_REQUIRED')),
           error_message TEXT,
           started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
           completed_at TIMESTAMP,
@@ -491,13 +493,13 @@ export function initSchema() {
     // 1. Runs Table
     try {
       const runsSchema = db.prepare("SELECT sql FROM sqlite_schema WHERE type='table' AND name='Runs'").get() as any;
-      if (runsSchema && (!runsSchema.sql.includes('AWAITING_HUMAN_REVIEW') || !runsSchema.sql.includes('INTERVENTION_REQUIRED') || !runsSchema.sql.includes('updated_at'))) {
+      if (runsSchema && (!runsSchema.sql.includes('AWAITING_HUMAN_REVIEW') || !runsSchema.sql.includes('INTERVENTION_REQUIRED') || !runsSchema.sql.includes('CANCELLED') || !runsSchema.sql.includes('updated_at'))) {
         db.prepare("ALTER TABLE Runs RENAME TO Runs_old").run();
         db.prepare(`
           CREATE TABLE Runs (
             run_id TEXT PRIMARY KEY,
             topic TEXT NOT NULL,
-            status TEXT DEFAULT 'IN_PROGRESS' CHECK(status IN ('IN_PROGRESS', 'COMPLETED', 'PARTIAL_SUCCESS', 'FAILED', 'AWAITING_HUMAN_REVIEW', 'INTERVENTION_REQUIRED')),
+            status TEXT DEFAULT 'IN_PROGRESS' CHECK(status IN ('IN_PROGRESS', 'COMPLETED', 'PARTIAL_SUCCESS', 'FAILED', 'CANCELLED', 'AWAITING_HUMAN_REVIEW', 'INTERVENTION_REQUIRED')),
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
           )
@@ -528,7 +530,7 @@ export function initSchema() {
       CREATE TABLE IF NOT EXISTS Runs (
         run_id TEXT PRIMARY KEY,
         topic TEXT NOT NULL,
-        status TEXT DEFAULT 'IN_PROGRESS' CHECK(status IN ('IN_PROGRESS', 'COMPLETED', 'PARTIAL_SUCCESS', 'FAILED', 'AWAITING_HUMAN_REVIEW', 'INTERVENTION_REQUIRED')),
+        status TEXT DEFAULT 'IN_PROGRESS' CHECK(status IN ('IN_PROGRESS', 'COMPLETED', 'PARTIAL_SUCCESS', 'FAILED', 'CANCELLED', 'AWAITING_HUMAN_REVIEW', 'INTERVENTION_REQUIRED')),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
@@ -551,9 +553,24 @@ export function initSchema() {
         response_text TEXT, 
         extraction_method TEXT CHECK(extraction_method IN ('clean', 'timeout_forced', 'manual', 'api')),
         status TEXT NOT NULL,
+        attempt_no INTEGER DEFAULT 1,
+        failure_code TEXT,
+        submission_confirmed INTEGER DEFAULT 0 CHECK(submission_confirmed IN (0, 1)),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `).run();
+
+    const taskColumns = db.prepare("PRAGMA table_info(Tasks)").all() as any[];
+    const taskColumnNames = new Set(taskColumns.map(col => col.name));
+    for (const [columnName, columnType] of [
+      ['attempt_no', 'INTEGER DEFAULT 1'],
+      ['failure_code', 'TEXT'],
+      ['submission_confirmed', 'INTEGER DEFAULT 0 CHECK(submission_confirmed IN (0, 1))']
+    ]) {
+      if (!taskColumnNames.has(columnName)) {
+        db.prepare(`ALTER TABLE Tasks ADD COLUMN ${columnName} ${columnType}`).run();
+      }
+    }
 
     // 3. Lineage Table
     db.prepare(`
@@ -613,6 +630,7 @@ export function initSchema() {
       if (nodeInvocationsTableSql && (
         !nodeInvocationsTableSql.sql.includes('AWAITING_HUMAN_REVIEW') ||
         !nodeInvocationsTableSql.sql.includes('INTERVENTION_REQUIRED') ||
+        !nodeInvocationsTableSql.sql.includes('CANCELLED') ||
         !nodeInvocationsTableSql.sql.includes('required_for_run_success') ||
         !nodeInvocationsTableSql.sql.includes('failure_policy') ||
         !nodeInvocationsTableSql.sql.includes('iteration_no')
@@ -624,7 +642,7 @@ export function initSchema() {
             run_id TEXT NOT NULL REFERENCES Runs(run_id) ON DELETE CASCADE,
             node_id TEXT NOT NULL,
             iteration_no INTEGER DEFAULT 1,
-            status TEXT NOT NULL CHECK(status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'SKIPPED', 'AWAITING_HUMAN_REVIEW', 'INTERVENTION_REQUIRED')),
+            status TEXT NOT NULL CHECK(status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'SKIPPED', 'CANCELLED', 'AWAITING_HUMAN_REVIEW', 'INTERVENTION_REQUIRED')),
             required_for_run_success INTEGER DEFAULT 1 CHECK(required_for_run_success IN (0, 1)),
             failure_policy TEXT DEFAULT 'fail_run' CHECK(failure_policy IN ('fail_run', 'skip_branch', 'continue_with_warning')),
             input_snapshot_json TEXT,
@@ -662,7 +680,7 @@ export function initSchema() {
         run_id TEXT NOT NULL REFERENCES Runs(run_id) ON DELETE CASCADE,
         node_id TEXT NOT NULL,
         iteration_no INTEGER DEFAULT 1,
-        status TEXT NOT NULL CHECK(status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'SKIPPED', 'AWAITING_HUMAN_REVIEW', 'INTERVENTION_REQUIRED')),
+        status TEXT NOT NULL CHECK(status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'SKIPPED', 'CANCELLED', 'AWAITING_HUMAN_REVIEW', 'INTERVENTION_REQUIRED')),
         required_for_run_success INTEGER DEFAULT 1 CHECK(required_for_run_success IN (0, 1)),
         failure_policy TEXT DEFAULT 'fail_run' CHECK(failure_policy IN ('fail_run', 'skip_branch', 'continue_with_warning')),
         input_snapshot_json TEXT,
@@ -676,7 +694,7 @@ export function initSchema() {
 
     try {
       const taskAttemptsTableSql = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='TaskAttempts'").get() as any;
-      if (taskAttemptsTableSql && !taskAttemptsTableSql.sql.includes('INTERVENTION_REQUIRED')) {
+      if (taskAttemptsTableSql && (!taskAttemptsTableSql.sql.includes('INTERVENTION_REQUIRED') || !taskAttemptsTableSql.sql.includes('CANCELLED'))) {
         db.prepare("ALTER TABLE TaskAttempts RENAME TO TaskAttempts_old").run();
         db.prepare(`
           CREATE TABLE TaskAttempts (
@@ -686,7 +704,7 @@ export function initSchema() {
             provider_name TEXT NOT NULL,
             prompt_payload TEXT NOT NULL,
             response_text TEXT,
-            status TEXT NOT NULL CHECK(status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'INTERVENTION_REQUIRED')),
+            status TEXT NOT NULL CHECK(status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED', 'INTERVENTION_REQUIRED')),
             error_message TEXT,
             started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             completed_at TIMESTAMP
@@ -720,7 +738,7 @@ export function initSchema() {
         context_mode TEXT,
         context_fidelity TEXT,
         adapter_state_json TEXT,
-        status TEXT NOT NULL CHECK(status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'INTERVENTION_REQUIRED')),
+        status TEXT NOT NULL CHECK(status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED', 'INTERVENTION_REQUIRED')),
         error_message TEXT,
         started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         completed_at TIMESTAMP
@@ -1062,9 +1080,24 @@ export class DBService {
   /**
    * Updates a run's status
    */
-  public static updateRunStatus(runId: string, status: 'IN_PROGRESS' | 'COMPLETED' | 'PARTIAL_SUCCESS' | 'FAILED' | 'AWAITING_HUMAN_REVIEW' | 'INTERVENTION_REQUIRED'): void {
+  public static getRunStatus(runId: string): RunStatus | null {
+    const row = getDB().prepare('SELECT status FROM Runs WHERE run_id = ?').get(runId) as { status?: RunStatus } | undefined;
+    return row?.status ?? null;
+  }
+
+  public static updateRunStatus(runId: string, status: RunStatus): void {
     const stmt = getDB().prepare('UPDATE Runs SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE run_id = ?');
     stmt.run(status, runId);
+  }
+
+  public static updateRunStatusIfNotTerminal(runId: string, status: RunStatus): boolean {
+    const stmt = getDB().prepare(`
+      UPDATE Runs
+      SET status = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE run_id = ?
+        AND status NOT IN ('COMPLETED', 'PARTIAL_SUCCESS', 'FAILED', 'CANCELLED', 'INTERVENTION_REQUIRED')
+    `);
+    return stmt.run(status, runId).changes === 1;
   }
 
   /**
@@ -1076,12 +1109,13 @@ export class DBService {
     providerName: string;
     promptPayload: string;
     status: string;
+    attemptNo?: number;
   }): void {
     const stmt = getDB().prepare(`
-      INSERT INTO Tasks (task_id, run_id, provider_name, prompt_payload, status)
-      VALUES (@taskId, @runId, @providerName, @promptPayload, @status)
+      INSERT INTO Tasks (task_id, run_id, provider_name, prompt_payload, status, attempt_no)
+      VALUES (@taskId, @runId, @providerName, @promptPayload, @status, @attemptNo)
     `);
-    stmt.run(params);
+    stmt.run({ ...params, attemptNo: params.attemptNo ?? 1 });
   }
 
   /**
@@ -1097,6 +1131,7 @@ export class DBService {
       UPDATE Tasks 
       SET response_text = @responseText, extraction_method = @extractionMethod, status = @status
       WHERE task_id = @taskId
+        AND status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'INTERVENTION_REQUIRED')
     `);
     stmt.run(params);
   }
@@ -1105,8 +1140,33 @@ export class DBService {
    * Updates a task status
    */
   public static updateTaskStatus(taskId: string, status: string): void {
-    const stmt = getDB().prepare('UPDATE Tasks SET status = ? WHERE task_id = ?');
+    const stmt = getDB().prepare(`
+      UPDATE Tasks
+      SET status = ?
+      WHERE task_id = ?
+        AND status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'INTERVENTION_REQUIRED')
+    `);
     stmt.run(status, taskId);
+  }
+
+  public static markTaskSubmissionConfirmed(taskId: string): void {
+    getDB().prepare(`
+      UPDATE Tasks
+      SET submission_confirmed = 1
+      WHERE task_id = ?
+        AND status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'INTERVENTION_REQUIRED')
+    `).run(taskId);
+  }
+
+  public static failTaskWithClassification(taskId: string, status: 'FAILED' | 'CANCELLED' | 'INTERVENTION_REQUIRED', failureCode: FailureCode, submissionConfirmed: boolean): void {
+    getDB().prepare(`
+      UPDATE Tasks
+      SET status = ?,
+          failure_code = ?,
+          submission_confirmed = CASE WHEN submission_confirmed = 1 OR ? = 1 THEN 1 ELSE 0 END
+      WHERE task_id = ?
+        AND status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'INTERVENTION_REQUIRED')
+    `).run(status, failureCode, submissionConfirmed ? 1 : 0, taskId);
   }
 
   /**

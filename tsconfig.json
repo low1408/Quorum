@@ -22,6 +22,7 @@
     "from_orchestrator/security/**/*.ts",
     "from_orchestrator/types/**/*.d.ts",
     "from_orchestrator/tools/**/*.ts",
+    "scripts/**/*.ts",
     "tests/**/*.ts"
   ]
 }

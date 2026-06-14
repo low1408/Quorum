@@ -6,7 +6,9 @@
   "scripts": {
     "mcp:start": "node --experimental-strip-types from_orchestrator/mcp/server.ts",
     "typecheck": "tsc --noEmit",
-    "test": "DATABASE_PATH=/tmp/quorum-council-test.db node --experimental-strip-types --test tests/*.test.ts"
+    "test": "NODE_ENV=test DATABASE_PATH=/tmp/quorum-council-test.db node --experimental-strip-types --test tests/*.test.ts",
+    "review-context": "node --experimental-strip-types scripts/generate-review-context.ts",
+    "review-context:test": "node --experimental-strip-types scripts/generate-review-context.ts --validate"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.18.2",

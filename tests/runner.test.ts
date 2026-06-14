@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { getDB, initSchema } from '../from_orchestrator/db/database.ts';
 import { OrchestrationRunner } from '../from_orchestrator/engine/runner.ts';
+import type { SessionPoolItem } from '../from_orchestrator/engine/providerSessionPool.ts';
 
 test('runner force-extracts visible output when completion wait reports a late anomaly', async () => {
   initSchema();
@@ -37,7 +38,7 @@ test('runner force-extracts visible output when completion wait reports a late a
     page: fakePage,
     hasActiveThread: false,
     isCdp: true
-  });
+  } as unknown as SessionPoolItem);
 
   assert.equal(result, 'visible consolidated report');
 

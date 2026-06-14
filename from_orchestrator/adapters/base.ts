@@ -7,6 +7,13 @@ export interface HealthStatus {
 
 export type AnomalyType = 'NONE' | 'CAPTCHA' | 'AUTH_EXPIRED' | 'RATE_LIMITED' | 'UNKNOWN';
 
+export type BrowserOperationOptions = {
+  signal?: AbortSignal;
+  firstTokenMs?: number;
+  outputStabilizationMs?: number;
+  pasteOnly?: boolean;
+};
+
 export interface BaseAdapter {
   providerId: string;
   type: 'api' | 'browser';
@@ -24,7 +31,7 @@ export interface BrowserAdapter extends BaseAdapter {
   /**
    * Type prompt into input and trigger generation
    */
-  dispatchPrompt(page: Page, prompt: string, options?: { pasteOnly?: boolean }): Promise<void>;
+  dispatchPrompt(page: Page, prompt: string, options?: BrowserOperationOptions): Promise<void>;
 
   /**
    * Dispatch multiple prompt segments sequentially into the same chat thread.
@@ -36,7 +43,7 @@ export interface BrowserAdapter extends BaseAdapter {
   /**
    * Monitor WebSocket, Server-Sent Events (SSE), or network patterns to resolve EXACTLY when streaming ends.
    */
-  awaitNetworkCompletion(page: Page): Promise<void>;
+  awaitNetworkCompletion(page: Page, options?: BrowserOperationOptions): Promise<void>;
 
   /**
    * Extract the DOM of the target page and normalize complex structures to unified Markdown

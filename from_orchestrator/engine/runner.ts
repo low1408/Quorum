@@ -1,23 +1,15 @@
 import { chromium } from 'playwright-extra';
 import stealthPlugin from 'puppeteer-extra-plugin-stealth';
+import type { Browser, BrowserContext, Page } from 'playwright';
 import type { BrowserAdapter } from '../adapters/base.ts';
-import { ChatGPTAdapter } from '../adapters/chatgpt.ts';
-import { GeminiAdapter } from '../adapters/gemini.ts';
-import { ClaudeAdapter } from '../adapters/claude.ts';
-import { QwenAdapter } from '../adapters/qwen.ts';
-import { DeepseekAdapter } from '../adapters/deepseek.ts';
-import { MetaAIAdapter } from '../adapters/meta.ts';
-import { MiMoAdapter } from '../adapters/mimo.ts';
-import { MiniMaxAdapter } from '../adapters/minimax.ts';
-import { PerplexityAdapter } from '../adapters/perplexity.ts';
-import { KimiAdapter } from '../adapters/kimi.ts';
-import { GrokAdapter } from '../adapters/grok.ts';
-import { ZaiAdapter } from '../adapters/zai.ts';
-import { MockAdapter } from '../adapters/mock.ts';
+import { createAdapter } from '../adapters/registry.ts';
 import { SessionManager } from '../security/sessionManager.ts';
 import { DBService } from '../db/database.ts';
 import { config } from '../config/index.ts';
 import { splitPromptIntoChunks } from '../tools/promptChunker.ts';
+import { abortableDelay, abortableRace, createCancelledError, isAbortError, throwIfAborted } from './statuses.ts';
+import { closeSessionItem, type SessionPoolItem } from './providerSessionPool.ts';
+import { DomainError, classifyFailure } from './failures.ts';
 
 // Add stealth plugin to playwright chromium extra
 const chromiumExtra = chromium;
@@ -27,25 +19,7 @@ try {
   // Ignore if already registered
 }
 
-export function getAdapter(providerId: string): BrowserAdapter {
-  switch (providerId.toLowerCase()) {
-    case 'chatgpt': return new ChatGPTAdapter();
-    case 'gemini': return new GeminiAdapter();
-    case 'claude': return new ClaudeAdapter();
-    case 'qwen': return new QwenAdapter();
-    case 'deepseek': return new DeepseekAdapter();
-    case 'meta': return new MetaAIAdapter();
-    case 'mimo': return new MiMoAdapter();
-    case 'minimax': return new MiniMaxAdapter();
-    case 'perplexity': return new PerplexityAdapter();
-    case 'kimi': return new KimiAdapter();
-    case 'grok': return new GrokAdapter();
-    case 'z-ai': return new ZaiAdapter();
-    case 'mock': return new MockAdapter();
-    default:
-      throw new Error(`Unsupported provider: ${providerId}`);
-  }
-}
+export const getAdapter = createAdapter;
 
 export type OrchestrationState = 
   | 'IDLE' 
@@ -55,7 +29,8 @@ export type OrchestrationState =
   | 'EXTRACTING' 
   | 'INTERVENTION_REQUIRED'
   | 'COMPLETE' 
-  | 'FAILED';
+  | 'FAILED'
+  | 'CANCELLED';
 
 export class InterventionRequiredError extends Error {
   public code = 'INTERVENTION_REQUIRED';
@@ -68,12 +43,51 @@ export class InterventionRequiredError extends Error {
   }
 }
 
-export interface SessionPoolItem {
-  browser: any;
-  context: any;
-  page: any;
-  hasActiveThread: boolean;
-  isCdp?: boolean;
+export type { SessionPoolItem } from './providerSessionPool.ts';
+
+export interface RunnerTimeoutBudgets {
+  navigationMs: number;
+  inputReadyMs: number;
+  submissionMs: number;
+  firstTokenMs: number;
+  outputStabilizationMs: number;
+  providerExecutionMs: number;
+}
+
+export type RunnerExecuteOptions = {
+  pasteOnly?: boolean;
+  signal?: AbortSignal;
+  timeouts?: Partial<RunnerTimeoutBudgets>;
+  attemptNo?: number;
+};
+
+const DEFAULT_RUNNER_TIMEOUTS: RunnerTimeoutBudgets = {
+  navigationMs: 30_000,
+  inputReadyMs: 15_000,
+  submissionMs: 30_000,
+  firstTokenMs: 60_000,
+  outputStabilizationMs: 180_000,
+  providerExecutionMs: 6 * 60_000
+};
+
+function timeoutError(stage: string, ms: number): Error {
+  return new DomainError({
+    code: 'TIMEOUT',
+    message: `${stage} timed out after ${ms}ms.`,
+    stage
+  });
+}
+
+async function withStageTimeout<T>(stage: string, ms: number, work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    const timeoutPromise = new Promise<T>((_, reject) => {
+      timeout = setTimeout(() => reject(timeoutError(stage, ms)), ms);
+    });
+    return await abortableRace(Promise.race([work, timeoutPromise]), signal, `${stage} cancelled.`);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
 }
 
 function getOSAlignedUserAgent(): string {
@@ -95,6 +109,8 @@ export class OrchestrationRunner {
   private stateStartTime: number;
   private isCdpConnection: boolean = false;
   private manageRunStatus: boolean;
+  private currentResources: SessionPoolItem | null = null;
+  private disposed = false;
 
   constructor(
     runId: string,
@@ -107,6 +123,19 @@ export class OrchestrationRunner {
     this.taskId = taskId;
     this.stateStartTime = Date.now();
     this.manageRunStatus = options.manageRunStatus ?? true;
+  }
+
+  public async close(): Promise<void> {
+    if (this.disposed) return;
+    this.disposed = true;
+    if (this.currentResources) {
+      await closeSessionItem(this.currentResources, 'runner close');
+      this.currentResources = null;
+    }
+  }
+
+  public async dispose(): Promise<void> {
+    await this.close();
   }
 
   /**
@@ -145,17 +174,17 @@ export class OrchestrationRunner {
       status: 'COMPLETED',
     });
     if (this.manageRunStatus) {
-      DBService.updateRunStatus(this.runId, 'COMPLETED');
+      DBService.updateRunStatusIfNotTerminal(this.runId, 'COMPLETED');
     }
   }
 
-  private async forceExtractAfterCompletionFailure(page: any, error: any): Promise<string | null> {
+  private async forceExtractAfterCompletionFailure(page: Page, error: any, signal?: AbortSignal): Promise<string | null> {
     console.warn(`[WARNING] Completion wait failed for ${this.taskId}: ${error?.message || String(error)}`);
     console.warn('[WARNING] Attempting forced extraction before failing the task...');
 
     try {
       this.transitionTo('EXTRACTING');
-      const markdown = await this.adapter.extractAndNormalizeAST(page);
+      const markdown = await abortableRace(this.adapter.extractAndNormalizeAST(page), signal, 'Forced extraction cancelled.');
       if (!markdown || !markdown.trim()) {
         return null;
       }
@@ -172,10 +201,18 @@ export class OrchestrationRunner {
   /**
    * Executes a prompt task end-to-end through the state machine.
    */
-  public async executeTask(prompt: string, poolItem?: SessionPoolItem, options?: { pasteOnly?: boolean }): Promise<string> {
+  public async executeTask(prompt: string, poolItem?: SessionPoolItem, options: RunnerExecuteOptions = {}): Promise<string> {
     console.log(`Starting run: ${this.runId}, task: ${this.taskId}`);
+    const timeouts = { ...DEFAULT_RUNNER_TIMEOUTS, ...(options.timeouts || {}) };
+    const signal = options.signal;
+    let submissionConfirmed = false;
+    throwIfAborted(signal);
 
-    // Create DB entries
+    const onAbort = () => {
+      void this.close();
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+
     DBService.createRun(this.runId, prompt.substring(0, 100));
     DBService.createTask({
       taskId: this.taskId,
@@ -183,9 +220,11 @@ export class OrchestrationRunner {
       providerName: this.adapter.providerId,
       promptPayload: prompt,
       status: 'IN_PROGRESS',
+      attemptNo: options.attemptNo ?? 1,
     });
 
     if (this.adapter.providerId.toLowerCase() === 'mock') {
+      throwIfAborted(signal);
       this.transitionTo('DISPATCHING');
       this.transitionTo('STREAMING');
       this.transitionTo('STABILIZING');
@@ -198,23 +237,31 @@ export class OrchestrationRunner {
         status: 'COMPLETED',
       });
       if (this.manageRunStatus) {
-        DBService.updateRunStatus(this.runId, 'COMPLETED');
+        DBService.updateRunStatusIfNotTerminal(this.runId, 'COMPLETED');
       }
       this.transitionTo('COMPLETE');
+      signal?.removeEventListener('abort', onAbort);
       return response;
     }
 
     this.stateStartTime = Date.now();
-    let browser: any = null;
-    let context: any = null;
-    let page: any = null;
+    let browser: Browser | null = null;
+    let context: BrowserContext | null = null;
+    let page: Page | null = null;
+    let ownsBrowser = false;
+    let ownsContext = false;
+    let ownsPage = false;
 
     try {
+      throwIfAborted(signal);
       if (poolItem && poolItem.browser) {
         browser = poolItem.browser;
         context = poolItem.context;
         this.isCdpConnection = !!poolItem.isCdp;
-        
+        ownsBrowser = !!poolItem.ownsBrowser;
+        ownsContext = !!poolItem.ownsContext;
+        ownsPage = poolItem.ownsPage !== false;
+
         let isPageValid = false;
         if (poolItem.page) {
           try {
@@ -229,24 +276,28 @@ export class OrchestrationRunner {
           console.log(`Reusing active persistent browser tab for [${this.adapter.providerId.toUpperCase()}]`);
         } else {
           console.log(`Persistent tab for [${this.adapter.providerId.toUpperCase()}] is closed/missing. Spawning a NEW tab...`);
-          page = await context.newPage();
+          page = await abortableRace(context!.newPage(), signal, 'Page creation cancelled.');
+          ownsPage = true;
           poolItem.page = page;
+          poolItem.ownsPage = true;
           console.log(`Navigating to ${this.adapter.baseUrl}...`);
-          await page.goto(this.adapter.baseUrl, { waitUntil: 'domcontentloaded' });
+          await withStageTimeout('navigation', timeouts.navigationMs, page.goto(this.adapter.baseUrl, { waitUntil: 'domcontentloaded', timeout: timeouts.navigationMs }), signal);
         }
       } else {
         if (config.cdpEndpoint) {
           console.log(`Connecting to existing browser via CDP: ${config.cdpEndpoint}...`);
           try {
-            browser = await chromiumExtra.connectOverCDP(config.cdpEndpoint, { timeout: 5000 });
-            context = browser.contexts()[0];
+            browser = await abortableRace(chromiumExtra.connectOverCDP(config.cdpEndpoint, { timeout: 5000 }), signal, 'CDP connection cancelled.');
+            context = browser.contexts()[0] || null;
             if (!context) {
-              context = await browser.newContext({
+              context = await abortableRace(browser.newContext({
                 viewport: { width: 1280, height: 800 },
                 userAgent: getOSAlignedUserAgent(),
-              });
+              }), signal, 'Context creation cancelled.');
+              ownsContext = true;
             }
-            page = await context.newPage();
+            page = await abortableRace(context.newPage(), signal, 'Page creation cancelled.');
+            ownsPage = true;
             this.isCdpConnection = true;
           } catch (err: any) {
             console.warn(`\n⚠️ [CDP CONNECTION FAILED]: ${err.message}`);
@@ -257,9 +308,8 @@ export class OrchestrationRunner {
         }
 
         if (!this.isCdpConnection) {
-          // 1. Launch Browser
           console.log('Launching browser context...');
-          browser = await chromiumExtra.launch({
+          browser = await abortableRace(chromiumExtra.launch({
             headless: config.headless,
             args: [
               '--disable-blink-features=AutomationControlled',
@@ -267,25 +317,25 @@ export class OrchestrationRunner {
               '--disable-dev-shm-usage',
               '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
             ],
-          });
+          }), signal, 'Browser launch cancelled.');
+          ownsBrowser = true;
 
-          // 2. Load Session Memory decryption
           const storageState = await SessionManager.loadSession(this.adapter.providerId);
-          
-          context = await browser.newContext({
+
+          context = await abortableRace(browser.newContext({
             storageState: storageState || undefined,
             viewport: { width: 1280, height: 800 },
             userAgent: getOSAlignedUserAgent(),
-          });
+          }), signal, 'Context creation cancelled.');
+          ownsContext = true;
 
-          await this.adapter.initSession(context);
-          
-          page = await context.newPage();
+          await abortableRace(this.adapter.initSession(context), signal, 'Session initialization cancelled.');
+          page = await abortableRace(context.newPage(), signal, 'Page creation cancelled.');
+          ownsPage = true;
         }
-        
-        // Navigate to ChatGPT
+
         console.log(`Navigating to ${this.adapter.baseUrl}...`);
-        await page.goto(this.adapter.baseUrl, { waitUntil: 'domcontentloaded' });
+        await withStageTimeout('navigation', timeouts.navigationMs, page!.goto(this.adapter.baseUrl, { waitUntil: 'domcontentloaded', timeout: timeouts.navigationMs }), signal);
 
         if (poolItem) {
           poolItem.browser = browser;
@@ -293,11 +343,25 @@ export class OrchestrationRunner {
           poolItem.page = page;
           poolItem.hasActiveThread = false;
           poolItem.isCdp = this.isCdpConnection;
+          poolItem.ownsBrowser = ownsBrowser;
+          poolItem.ownsContext = ownsContext;
+          poolItem.ownsPage = ownsPage;
+          poolItem.lastUsedAt = Date.now();
         }
       }
 
-      // Anomaly / Session Check
-      let anomaly = await this.adapter.detectAnomaly(page);
+      this.currentResources = {
+        browser,
+        context,
+        page,
+        hasActiveThread: poolItem?.hasActiveThread ?? false,
+        isCdp: this.isCdpConnection,
+        ownsBrowser,
+        ownsContext,
+        ownsPage
+      };
+
+      let anomaly = await abortableRace(this.adapter.detectAnomaly(page!), signal, 'Anomaly detection cancelled.');
       if (anomaly === 'AUTH_EXPIRED') {
         this.transitionTo('INTERVENTION_REQUIRED');
         console.warn('------------------------------------------------------------');
@@ -306,33 +370,32 @@ export class OrchestrationRunner {
         console.warn('The Orchestrator will pause and wait for authentication...');
         console.warn('------------------------------------------------------------');
 
-        // Poll until prompt-textarea is available (proving login success)
         let authenticated = false;
-        const authTimeout = 5 * 60 * 1000; // 5 minutes timeout
+        const authTimeout = 5 * 60 * 1000;
         const startAuth = Date.now();
 
         while (Date.now() - startAuth < authTimeout) {
+          throwIfAborted(signal);
           try {
-            const isTextareaPresent = await this.adapter.isInputReady(page);
+            const isTextareaPresent = await withStageTimeout('input readiness', timeouts.inputReadyMs, this.adapter.isInputReady(page!), signal);
             if (isTextareaPresent) {
               authenticated = true;
               break;
             }
           } catch {
-            // Ignore evaluator errors while page is transitioning
+            // Ignore evaluator errors while page is transitioning.
           }
-          await page.waitForTimeout(2000);
+          await abortableDelay(2000, signal);
         }
 
         if (!authenticated) {
           throw new InterventionRequiredError('Authentication intervention timed out after 5 minutes.', 'auth_expiry');
         }
 
-        // Save session immediately so next launches are fully automated
         if (!this.isCdpConnection) {
           console.log('Authentication successful! Extracting and encrypting storage state...');
-          const newState = await context.storageState();
-          await SessionManager.saveSession(this.adapter.providerId, newState);
+          const newState = await abortableRace(context!.storageState(), signal, 'Session save cancelled.');
+          await abortableRace(SessionManager.saveSession(this.adapter.providerId, newState), signal, 'Session save cancelled.');
           console.log('Session saved successfully.');
         } else {
           console.log('Authentication successful!');
@@ -344,29 +407,19 @@ export class OrchestrationRunner {
         throw new InterventionRequiredError(`Execution blocked by anomaly: ${anomaly}`, anomaly === 'CAPTCHA' ? 'captcha_intervention' : 'provider_intervention');
       }
 
-      // Auto-chunk oversized prompts for constrained providers (e.g. Qwen, MiMo).
-      // If the prompt exceeds the adapter's per-message character budget, split it
-      // into acknowledged context-loading chunks and route through the multi-segment
-      // pipeline. The intermediate chunks carry a "do not reply" directive so the
-      // model outputs only a brief acknowledgment token instead of a full response.
-      // pasteOnly tasks are never chunked — the caller controls submission manually.
       const maxChars = (this.adapter as any).maxPromptChars as number ?? 80_000;
-      if (!options?.pasteOnly && prompt.length > maxChars) {
+      if (!options.pasteOnly && prompt.length > maxChars) {
         const chunks = splitPromptIntoChunks(prompt, maxChars, `${this.adapter.providerId} prompt`);
         console.log(`[CHUNKING] ✂️ Prompt (${prompt.length} chars) exceeds ${maxChars}-char limit for [${this.adapter.providerId.toUpperCase()}]. Splitting into ${chunks.length} chunks via multi-segment path...`);
-
-        // Delegate to executeMultiSegmentTask which handles browser setup, anomaly
-        // checks, segment dispatch, and DB persistence. We must close the browser
-        // at the end of this re-entrant call since poolItem ownership stays with caller.
-        return await this.adapter.dispatchMultiSegmentPrompt(page, chunks);
+        return await withStageTimeout('provider execution', timeouts.providerExecutionMs, this.adapter.dispatchMultiSegmentPrompt(page!, chunks), signal);
       }
 
-      // Transition to Dispatching
       this.transitionTo('DISPATCHING');
-      await this.adapter.dispatchPrompt(page, prompt, options);
+      await withStageTimeout('submission', timeouts.submissionMs, this.adapter.dispatchPrompt(page!, prompt, options), signal);
+      submissionConfirmed = true;
+      DBService.markTaskSubmissionConfirmed(this.taskId);
 
-      if (options?.pasteOnly) {
-        // Pause and wait for manual user action
+      if (options.pasteOnly) {
         console.log('\n============================================================');
         console.log('⚠️ [MANUAL INTERVENTION] Socratic Critic prompt has been pasted.');
         console.log('Please review, edit, or submit the prompt manually in the browser.');
@@ -377,98 +430,105 @@ export class OrchestrationRunner {
           input: process.stdin,
           output: process.stdout,
         });
-        await new Promise<void>((resolve) => {
+        await abortableRace(new Promise<void>((resolve) => {
           rlInterface.question('Press ENTER when response is ready to extract...', () => {
             rlInterface.close();
             resolve();
           });
-        });
+        }), signal, 'Manual extraction wait cancelled.');
 
-        // Transition to Extracting
         this.transitionTo('EXTRACTING');
-        const markdown = await this.adapter.extractAndNormalizeAST(page);
-        
+        const markdown = await abortableRace(this.adapter.extractAndNormalizeAST(page!), signal, 'Extraction cancelled.');
+
         if (!markdown) {
           const err = new Error('Extraction yielded empty markdown output.');
           (err as any).failure_class = 'empty_extraction';
+          (err as any).submissionConfirmed = submissionConfirmed;
           throw err;
         }
 
-        // Save Response & transition to complete
         await this.persistExtractedResponse(markdown, 'clean');
         this.transitionTo('COMPLETE');
 
-        // Update Session context with latest updates/cookies
         if (!this.isCdpConnection) {
-          const finalState = await context.storageState();
-          await SessionManager.saveSession(this.adapter.providerId, finalState);
+          const finalState = await abortableRace(context!.storageState(), signal, 'Session save cancelled.');
+          await abortableRace(SessionManager.saveSession(this.adapter.providerId, finalState), signal, 'Session save cancelled.');
         }
 
         return markdown;
       }
 
-      // Transition to Streaming
       this.transitionTo('STREAMING');
       try {
-        await this.adapter.awaitNetworkCompletion(page);
+        await withStageTimeout('output stabilization', timeouts.outputStabilizationMs, this.adapter.awaitNetworkCompletion(page!, {
+          signal,
+          firstTokenMs: timeouts.firstTokenMs,
+          outputStabilizationMs: timeouts.outputStabilizationMs
+        }), signal);
       } catch (completionErr: any) {
-        const forcedMarkdown = await this.forceExtractAfterCompletionFailure(page, completionErr);
+        if (isAbortError(completionErr)) throw completionErr;
+        const forcedMarkdown = await this.forceExtractAfterCompletionFailure(page!, completionErr, signal);
         if (forcedMarkdown) {
           if (!this.isCdpConnection) {
-            const finalState = await context.storageState();
-            await SessionManager.saveSession(this.adapter.providerId, finalState);
+            const finalState = await abortableRace(context!.storageState(), signal, 'Session save cancelled.');
+            await abortableRace(SessionManager.saveSession(this.adapter.providerId, finalState), signal, 'Session save cancelled.');
           }
           return forcedMarkdown;
         }
         throw completionErr;
       }
 
-      // Transition to Stabilizing (Mutation observer style delay)
       this.transitionTo('STABILIZING');
-      // Wait 500ms of absolute silence for content layout stabilization
-      await page.waitForTimeout(500);
+      await abortableDelay(500, signal);
 
-      // Transition to Extracting
       this.transitionTo('EXTRACTING');
-      const markdown = await this.adapter.extractAndNormalizeAST(page);
-      
+      const markdown = await abortableRace(this.adapter.extractAndNormalizeAST(page!), signal, 'Extraction cancelled.');
+
       if (!markdown) {
         const err = new Error('Extraction yielded empty markdown output.');
         (err as any).failure_class = 'empty_extraction';
+        (err as any).submissionConfirmed = submissionConfirmed;
         throw err;
       }
 
-      // Save Response & transition to complete
       await this.persistExtractedResponse(markdown, 'clean');
       this.transitionTo('COMPLETE');
 
-      // Update Session context with latest updates/cookies
       if (!this.isCdpConnection) {
-        const finalState = await context.storageState();
-        await SessionManager.saveSession(this.adapter.providerId, finalState);
+        const finalState = await abortableRace(context!.storageState(), signal, 'Session save cancelled.');
+        await abortableRace(SessionManager.saveSession(this.adapter.providerId, finalState), signal, 'Session save cancelled.');
       }
 
       return markdown;
     } catch (error: any) {
       console.error(`Task execution failed: ${error.message}`);
-      
-      DBService.updateTaskStatus(this.taskId, 'FAILED');
+
+      const cancelled = isAbortError(error);
+      const failure = classifyFailure(error, submissionConfirmed);
+      (error as any).submissionConfirmed = failure.submissionConfirmed;
+      (error as any).failure_code = failure.code;
+      DBService.failTaskWithClassification(this.taskId, cancelled ? 'CANCELLED' : 'FAILED', failure.code, failure.submissionConfirmed);
       if (this.manageRunStatus) {
-        DBService.updateRunStatus(this.runId, 'FAILED');
+        DBService.updateRunStatusIfNotTerminal(this.runId, cancelled ? 'CANCELLED' : 'FAILED');
       }
-      this.transitionTo('FAILED');
-      
+      this.transitionTo(cancelled ? 'CANCELLED' : 'FAILED');
+
       throw error;
     } finally {
-      // Only close context and browser if not in active keep-alive pooling mode
+      signal?.removeEventListener('abort', onAbort);
       if (!poolItem) {
-        if (this.isCdpConnection) {
-          if (page) await page.close().catch(() => {});
-        } else {
-          if (context) await context.close().catch(() => {});
-          if (browser) await browser.close().catch(() => {});
-        }
+        await closeSessionItem({
+          browser,
+          context,
+          page,
+          hasActiveThread: false,
+          isCdp: this.isCdpConnection,
+          ownsBrowser,
+          ownsContext,
+          ownsPage
+        }, 'runner finally').catch(() => {});
       }
+      this.currentResources = null;
     }
   }
 
@@ -504,15 +564,15 @@ export class OrchestrationRunner {
         status: 'COMPLETED',
       });
       if (this.manageRunStatus) {
-        DBService.updateRunStatus(this.runId, 'COMPLETED');
+        DBService.updateRunStatusIfNotTerminal(this.runId, 'COMPLETED');
       }
       return response;
     }
 
     this.stateStartTime = Date.now();
-    let browser: any = null;
-    let context: any = null;
-    let page: any = null;
+    let browser: Browser | null = null;
+    let context: BrowserContext | null = null;
+    let page: Page | null = null;
 
     try {
       // Browser/context/page setup is identical to executeTask
@@ -535,7 +595,7 @@ export class OrchestrationRunner {
           console.log(`Reusing active persistent browser tab for [${this.adapter.providerId.toUpperCase()}]`);
         } else {
           console.log(`Persistent tab for [${this.adapter.providerId.toUpperCase()}] is closed/missing. Spawning a NEW tab...`);
-          page = await context.newPage();
+          page = await context!.newPage();
           poolItem.page = page;
           console.log(`Navigating to ${this.adapter.baseUrl}...`);
           await page.goto(this.adapter.baseUrl, { waitUntil: 'domcontentloaded' });
@@ -587,7 +647,7 @@ export class OrchestrationRunner {
         }
         
         console.log(`Navigating to ${this.adapter.baseUrl}...`);
-        await page.goto(this.adapter.baseUrl, { waitUntil: 'domcontentloaded' });
+        await page!.goto(this.adapter.baseUrl, { waitUntil: 'domcontentloaded' });
 
         if (poolItem) {
           poolItem.browser = browser;
@@ -599,7 +659,7 @@ export class OrchestrationRunner {
       }
 
       // Anomaly / Session Check (same as executeTask)
-      let anomaly = await this.adapter.detectAnomaly(page);
+      let anomaly = await this.adapter.detectAnomaly(page!);
       if (anomaly === 'AUTH_EXPIRED') {
         this.transitionTo('INTERVENTION_REQUIRED');
         console.warn('------------------------------------------------------------');
@@ -614,7 +674,7 @@ export class OrchestrationRunner {
 
         while (Date.now() - startAuth < authTimeout) {
           try {
-            const isTextareaPresent = await this.adapter.isInputReady(page);
+            const isTextareaPresent = await this.adapter.isInputReady(page!);
             if (isTextareaPresent) {
               authenticated = true;
               break;
@@ -622,7 +682,7 @@ export class OrchestrationRunner {
           } catch {
             // Ignore evaluator errors while page is transitioning
           }
-          await page.waitForTimeout(2000);
+          await page!.waitForTimeout(2000);
         }
 
         if (!authenticated) {
@@ -631,7 +691,7 @@ export class OrchestrationRunner {
 
         if (!this.isCdpConnection) {
           console.log('Authentication successful! Extracting and encrypting storage state...');
-          const newState = await context.storageState();
+          const newState = await context!.storageState();
           await SessionManager.saveSession(this.adapter.providerId, newState);
           console.log('Session saved successfully.');
         } else {
@@ -646,7 +706,7 @@ export class OrchestrationRunner {
 
       // Multi-segment dispatch: each segment is its own message in the thread
       this.transitionTo('DISPATCHING');
-      const markdown = await this.adapter.dispatchMultiSegmentPrompt(page, segments);
+      const markdown = await this.adapter.dispatchMultiSegmentPrompt(page!, segments);
       this.transitionTo('COMPLETE');
 
       if (!markdown) {
@@ -660,7 +720,7 @@ export class OrchestrationRunner {
 
       // Update Session
       if (!this.isCdpConnection) {
-        const finalState = await context.storageState();
+        const finalState = await context!.storageState();
         await SessionManager.saveSession(this.adapter.providerId, finalState);
       }
 
@@ -670,19 +730,23 @@ export class OrchestrationRunner {
       
       DBService.updateTaskStatus(this.taskId, 'FAILED');
       if (this.manageRunStatus) {
-        DBService.updateRunStatus(this.runId, 'FAILED');
+        DBService.updateRunStatusIfNotTerminal(this.runId, 'FAILED');
       }
       this.transitionTo('FAILED');
       
       throw error;
     } finally {
       if (!poolItem) {
-        if (this.isCdpConnection) {
-          if (page) await page.close().catch(() => {});
-        } else {
-          if (context) await context.close().catch(() => {});
-          if (browser) await browser.close().catch(() => {});
-        }
+        await closeSessionItem({
+          browser,
+          context,
+          page,
+          hasActiveThread: false,
+          isCdp: this.isCdpConnection,
+          ownsBrowser: !this.isCdpConnection,
+          ownsContext: true,
+          ownsPage: true
+        }, 'multi-segment finally').catch(() => {});
       }
     }
   }

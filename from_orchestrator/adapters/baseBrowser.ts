@@ -1,5 +1,5 @@
 import type { Page, BrowserContext, Response } from 'playwright';
-import type { BrowserAdapter, AnomalyType, HealthStatus } from './base.ts';
+import type { BrowserAdapter, AnomalyType, HealthStatus, BrowserOperationOptions } from './base.ts';
 import { config } from '../config/index.ts';
 
 /**
@@ -237,7 +237,7 @@ export abstract class BaseBrowserAdapter implements BrowserAdapter {
   /**
    * Safe typing of prompt and clicking send button.
    */
-  public async dispatchPrompt(page: Page, prompt: string, options?: { pasteOnly?: boolean; suppressPasteOnlyLog?: boolean }): Promise<void> {
+  public async dispatchPrompt(page: Page, prompt: string, options?: BrowserOperationOptions & { suppressPasteOnlyLog?: boolean }): Promise<void> {
     // Pre-setup network listener if active for this provider
     this.setupConversationListener(page);
 
@@ -416,8 +416,19 @@ export abstract class BaseBrowserAdapter implements BrowserAdapter {
   /**
    * Races network stream response, DOM button states, and text length stability to determine completion.
    */
-  public async awaitNetworkCompletion(page: Page): Promise<void> {
+  public async awaitNetworkCompletion(page: Page, options: BrowserOperationOptions = {}): Promise<void> {
     let active = true;
+    const firstTokenMs = options.firstTokenMs ?? 60_000;
+    const outputStabilizationMs = options.outputStabilizationMs ?? 180_000;
+    const startedAt = Date.now();
+    const throwIfAborted = () => {
+      if (options.signal?.aborted) {
+        const err = new Error(options.signal.reason instanceof Error ? options.signal.reason.message : 'Operation cancelled.');
+        err.name = 'AbortError';
+        (err as any).code = 'CANCELLED';
+        throw err;
+      }
+    };
 
     // Count existing completed messages to index only the new response block
     const expectedIndex = await page.evaluate((sel) => {
@@ -433,9 +444,8 @@ export abstract class BaseBrowserAdapter implements BrowserAdapter {
       let buttonStableCount = 0;
       let generationStarted = false;
 
-      // Poll selectors every 500ms for up to 180s. Long defender and synthesis
-      // outputs can take far longer than ordinary chat replies.
-      for (let i = 0; i < 360; i++) {
+      for (let i = 0; Date.now() - startedAt < outputStabilizationMs; i++) {
+        throwIfAborted();
         if (!active) return;
 
         const isClosed = await page.evaluate(() => false).catch(() => true);
@@ -465,6 +475,9 @@ export abstract class BaseBrowserAdapter implements BrowserAdapter {
             generationStarted = true;
             console.log(`[STREAMING] 🚀 ${this.providerId.toUpperCase()} response stream started!`);
           } else {
+            if (Date.now() - startedAt > firstTokenMs) {
+              throw new Error(`First token timed out after ${firstTokenMs}ms`);
+            }
             if (i > 0 && i % 4 === 0) {
               console.log(`[STREAMING] 💤 Waiting for ${this.providerId.toUpperCase()} response stream...`);
             }
@@ -510,7 +523,20 @@ export abstract class BaseBrowserAdapter implements BrowserAdapter {
           }
         }
 
-        await page.waitForTimeout(500);
+        await Promise.race([
+          page.waitForTimeout(500),
+          new Promise<void>((_, reject) => {
+            if (!options.signal) return;
+            const onAbort = () => {
+              options.signal?.removeEventListener('abort', onAbort);
+              const err = new Error(options.signal?.reason instanceof Error ? options.signal.reason.message : 'Operation cancelled.');
+              err.name = 'AbortError';
+              (err as any).code = 'CANCELLED';
+              reject(err);
+            };
+            options.signal.addEventListener('abort', onAbort, { once: true });
+          })
+        ]);
       }
     })();
 
@@ -535,8 +561,9 @@ export abstract class BaseBrowserAdapter implements BrowserAdapter {
       await Promise.race([
         domPromise.catch((err) => {
           if (active) console.log(`[STREAMING] DOM tracker info: ${err.message}`);
+          throw err;
         }),
-        new Promise<void>((_, reject) => setTimeout(() => reject(new Error('Generation timed out after 180 seconds')), 180000))
+        new Promise<void>((_, reject) => setTimeout(() => reject(new Error(`Generation timed out after ${outputStabilizationMs}ms`)), outputStabilizationMs))
       ]);
     } catch (err: any) {
       const anomaly = await this.detectAnomaly(page, err).catch(() => 'UNKNOWN');
