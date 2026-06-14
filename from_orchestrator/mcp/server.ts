@@ -1,8 +1,11 @@
+import './patch-console.ts';
+
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { initSchema } from '../db/database.ts';
 import { runCouncilConsultation } from '../engine/council.ts';
+import { runCouncilDebate } from '../engine/councilDebate.ts';
 import { validateCouncilContext } from './contextValidation.ts';
 import { SUPPORTED_PROVIDER_IDS, validateProviderList } from '../adapters/registry.ts';
 
@@ -76,6 +79,44 @@ server.registerTool(
       providerTimeoutMs: args.provider_timeout_ms,
       maxConcurrency: args.max_concurrency,
       maxRetries: args.max_retries
+    });
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(result, null, 2)
+        }
+      ],
+      structuredContent: result
+    };
+  }
+);
+
+server.registerTool(
+  'consult_council_debate',
+  {
+    title: 'Consult Council Debate',
+    description: 'Send a coding question and selected repository context to a multi-round panel debate LLM council, then return one consolidated anonymous report.',
+    inputSchema: {
+      ...consultCouncilSchema,
+      debate_rounds_count: z.number().int().positive().optional()
+    }
+  },
+  async (args) => {
+    initSchema();
+
+    const validatedContext = validateCouncilContext(args.context, args.question);
+    const result = await runCouncilDebate({
+      question: args.question,
+      context: validatedContext,
+      constraints: args.constraints,
+      providers: args.providers,
+      maxWaitMs: args.max_wait_ms,
+      providerTimeoutMs: args.provider_timeout_ms,
+      maxConcurrency: args.max_concurrency,
+      maxRetries: args.max_retries,
+      debateRoundsCount: args.debate_rounds_count
     });
 
     return {
