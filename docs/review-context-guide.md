@@ -33,6 +33,18 @@ Preserve file boundaries with clear delimiters:
 
 Use line numbers when possible. Do not minify code or remove comments that explain invariants.
 
+For MCP consultations, prefer a generated JSON context over hand-built payloads. The JSON context keeps raw source bodies in `context.files` and describes them with `schema_version`, `evidence_manifest`, excerpt metadata, provenance, roles, and stable evidence IDs. Structured review prose should orient the reviewers, while source files remain the authoritative evidence.
+
+Each source item should identify:
+
+- `id` from the evidence manifest;
+- normalized `path`;
+- SHA-256 of the serialized content;
+- `role` such as `core`, `contract`, `config`, `test`, `runtime`, or `supporting`;
+- `provenance` such as `repository`, `generated`, `test-runtime`, or `caller-supplied`;
+- `relevance`;
+- line range, total line count, and whether the content is an excerpt.
+
 ## Evidence Selection
 
 Include complete implementation for decisive behavior:
@@ -73,6 +85,8 @@ Ask reviewers to classify each finding as one of:
 
 Each finding should include evidence, severity, confidence, and any missing context needed to strengthen or dismiss it.
 
+Claims without exact supporting evidence must be classified as **Unverifiable**. Validation and completeness warnings are coverage limitations, not findings by themselves.
+
 ## Standard Command
 
 Generate the default council lifecycle bundle with:
@@ -81,11 +95,18 @@ Generate the default council lifecycle bundle with:
 npm run review-context
 ```
 
+This writes both:
+
+- `review-context/council-lifecycle.md` for human inspection;
+- `review-context/council-lifecycle.context.json` for MCP-compatible council requests.
+
 Validate generation, required sections, and basic privacy exclusions with:
 
 ```bash
 npm run review-context:test
 ```
+
+Validation runs the test suite, checks the Markdown privacy exclusions, and round-trips the generated JSON through `validateCouncilContext`.
 
 ## Enforcing Structured MCP Context
 
@@ -108,3 +129,11 @@ When enabled, callers must include `context.structured_review` with these non-em
 - `omitted_material`
 
 The ordinary `context.files` array is still required so the council receives source evidence with file boundaries. The structured fields force callers to provide orientation, evidence grouping, runtime/test evidence, and explicit omissions instead of sending an unframed raw code dump.
+
+Direct MCP callers may also include:
+
+- `schema_version`;
+- `evidence_manifest`;
+- file-level `start_line`, `end_line`, `total_lines`, and `is_excerpt`.
+
+The MCP schema rejects unknown fields. The validator also rejects sensitive paths such as real `.env` files, session state, local databases, logs, `.git` internals, private keys, and saved council reports. `.env.example` is allowed when sanitized.
