@@ -6,7 +6,7 @@ import { validateCouncilRequestText } from '../mcp/contextValidation.ts';
 import type { ValidatedCouncilContext } from '../mcp/contextValidation.ts';
 import type { CouncilConsultationRequest, CouncilConsultationResult } from './council.ts';
 import { validateProviderList, normalizeProviderId } from '../adapters/registry.ts';
-import { closeSessionItem, ProviderSessionPool } from './providerSessionPool.ts';
+import { closeSessionItem, ProviderSessionPool, type SessionPoolItem } from './providerSessionPool.ts';
 import { createCancelledError, isAbortError } from './statuses.ts';
 import { classifyFailure } from './failures.ts';
 import type { FailureClassification } from './failures.ts';
@@ -23,7 +23,7 @@ import {
   delay,
   mapWithConcurrency,
   timeoutSignal,
-  acquireConsolidationSession,
+  createFreshProviderSession,
   buildCouncilAnalysisPrompt
 } from './council.ts';
 
@@ -37,8 +37,26 @@ export type CouncilDebateTurn = {
   inputTaskIds: string[];
 };
 
+
 export interface CouncilDebateRequest extends CouncilConsultationRequest {
   debateRoundsCount?: number;
+}
+
+function acquireConsolidationSession(pool: ProviderSessionPool, provider: string): {
+  session: SessionPoolItem;
+  transient: boolean;
+} {
+  const existing = pool.get(provider);
+  if (existing && !existing.invalidated && (existing.browser || existing.context || existing.page)) {
+    return {
+      session: createFreshProviderSession(existing),
+      transient: true
+    };
+  }
+  return {
+    session: pool.acquire(provider),
+    transient: false
+  };
 }
 
 /**

@@ -3,7 +3,7 @@ import { DBService } from '../db/database.ts';
 import { OrchestrationRunner, type RunnerTimeoutBudgets } from './runner.ts';
 import { validateCouncilRequestText, type ValidatedCouncilContext } from '../mcp/contextValidation.ts';
 import { validateProviderList, normalizeProviderId } from '../adapters/registry.ts';
-import { closeSessionItem, ProviderSessionPool, type SessionPoolItem } from './providerSessionPool.ts';
+import { ProviderSessionPool, type SessionPoolItem } from './providerSessionPool.ts';
 import { createCancelledError, isAbortError } from './statuses.ts';
 import { classifyFailure, type FailureClassification } from './failures.ts';
 
@@ -59,10 +59,6 @@ export function uniqueProviders(providers?: string[]): string[] {
   return validateProviderList(selected.map(normalizeProviderId), 'council providers');
 }
 
-function anonymizedSourceLabel(index: number): string {
-  return `ANALYSIS ${index + 1}`;
-}
-
 export function createFreshProviderSession(source?: SessionPoolItem): SessionPoolItem {
   return {
     browser: source?.browser || null,
@@ -76,24 +72,6 @@ export function createFreshProviderSession(source?: SessionPoolItem): SessionPoo
     providerId: source?.providerId,
     createdAt: Date.now(),
     lastUsedAt: Date.now()
-  };
-}
-
-export function acquireConsolidationSession(pool: ProviderSessionPool, provider: string): {
-  session: SessionPoolItem;
-  transient: boolean;
-} {
-  const existing = pool.get(provider);
-  if (existing && !existing.invalidated && (existing.browser || existing.context || existing.page)) {
-    return {
-      session: createFreshProviderSession(existing),
-      transient: true
-    };
-  }
-
-  return {
-    session: pool.acquire(provider),
-    transient: false
   };
 }
 
@@ -195,33 +173,10 @@ export function buildCouncilAnalysisPrompt(params: {
   ].filter(Boolean).join('\n\n');
 }
 
-export function buildCouncilConsolidationPrompt(params: {
-  question: string;
-  analyses: CouncilAnalysis[];
-  context?: ValidatedCouncilContext;
-  constraints?: string;
-}): string {
-  const analysisBlocks = params.analyses.map((analysis, index) =>
-    `--- ${anonymizedSourceLabel(index)} ---\n${analysis.response}`
-  ).join('\n\n');
-  const warnings = params.context ? renderContextWarnings(params.context.warnings) : '';
-  const repositoryEvidence = params.context ? renderRepositoryEvidence(params.context) : '';
-
-  return [
-    'You are consolidating independent council analyses for a coding agent.',
-    'Produce one anonymous, action-oriented Markdown report. Do not include provider names, model names, votes, or attribution.',
-    'Do not tell the agent to review individual analyses. Present final options the coding agent can act on.',
-    'Use exactly these top-level section headings: Recommendation, Options, Risks, Implementation Notes, Tests, Open Questions.',
-    'Retain only findings supported by exact repository evidence. Move unsupported claims, invented paths, invented symbols, and unverified test results to Open Questions.',
-    'Do not reproduce sensitive-looking literals from analyses or evidence.',
-    '',
-    `QUESTION:\n${params.question}`,
-    params.constraints ? `CONSTRAINTS:\n${params.constraints}` : '',
-    params.context ? `CONTEXT DIGEST:\n${params.context.context_digest}` : '',
-    warnings,
-    repositoryEvidence ? `REPOSITORY EVIDENCE FOR VERIFICATION:\n${repositoryEvidence}` : '',
-    `INDEPENDENT ANALYSES:\n${analysisBlocks}`
-  ].filter(Boolean).join('\n\n');
+export function buildDirectReport(analyses: CouncilAnalysis[]): string {
+  return analyses.map((analysis, index) =>
+    `## Council Member ${index + 1}\n\n${analysis.response}`
+  ).join('\n\n---\n\n');
 }
 
 export function providerTimeoutMs(request: { providerTimeoutMs?: number; maxWaitMs?: number }, providerCount: number): number {
@@ -404,47 +359,7 @@ async function runCouncilConsultationInner(request: CouncilConsultationRequest, 
       throw new Error(`All council members failed for run ${runId}.`);
     }
 
-    const consolidatorProvider = normalizeProviderId(process.env.COUNCIL_CONSOLIDATOR_PROVIDER || providers[0]);
-    validateProviderList([consolidatorProvider], 'consolidator provider');
-    const consolidationTaskId = `council_${runId}_consolidation`;
-    const consolidationPrompt = buildCouncilConsolidationPrompt({
-      question: request.question,
-      analyses,
-      context: request.context,
-      constraints: request.constraints
-    });
-
-    const consolidationTimeout = perProviderTimeoutMs;
-    const runner = runnerFactory({ runId, taskId: consolidationTaskId, provider: consolidatorProvider });
-    const controller = timeoutSignal(consolidationTimeout, `consolidation timed out after ${consolidationTimeout}ms.`);
-    const consolidationSession = acquireConsolidationSession(pool, consolidatorProvider);
-    let report: string;
-    try {
-      report = await runner.executeTask(consolidationPrompt, consolidationSession.session, {
-        signal: controller.signal,
-        timeouts: { providerExecutionMs: consolidationTimeout, ...request.timeouts },
-        attemptNo: 1
-      });
-    } catch (err: any) {
-      if (consolidationSession.transient) {
-        await closeSessionItem(consolidationSession.session, err?.message || String(err)).catch(() => {});
-      } else {
-        await pool.invalidate(consolidatorProvider, err?.message || String(err)).catch(() => {});
-      }
-      DBService.updateRunStatusIfNotTerminal(runId, 'FAILED');
-      throw new Error(`Council consolidation failed after ${analyses.length} successful analyses: ${err?.message || String(err)}`);
-    } finally {
-      controller.abort(createCancelledError('consolidation finished.'));
-      await runner.close().catch(() => {});
-      if (consolidationSession.transient) {
-        await closeSessionItem(consolidationSession.session, 'council consolidation finished').catch(() => {});
-      }
-    }
-
-    for (const analysis of analyses) {
-      DBService.addLineage(analysis.taskId, consolidationTaskId);
-    }
-
+    const report = buildDirectReport(analyses);
     const status = analyses.length === providers.length ? 'COMPLETED' : 'PARTIAL_SUCCESS';
     DBService.updateRunStatusIfNotTerminal(runId, status);
 
@@ -466,8 +381,6 @@ export async function runCouncilConsultation(request: CouncilConsultationRequest
   try {
     validateCouncilRequestText(request.question, request.constraints);
     uniqueProviders(request.providers);
-    const consolidatorProvider = process.env.COUNCIL_CONSOLIDATOR_PROVIDER;
-    if (consolidatorProvider) validateProviderList([consolidatorProvider], 'consolidator provider');
     return await runCouncilConsultationInner(request, runId);
   } catch (err: any) {
     if (err?.code === 'INTERVENTION_REQUIRED') {

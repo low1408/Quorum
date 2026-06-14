@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { getDB, initSchema } from '../from_orchestrator/db/database.ts';
-import { buildCouncilAnalysisPrompt, buildCouncilConsolidationPrompt, runCouncilConsultation } from '../from_orchestrator/engine/council.ts';
+import { buildCouncilAnalysisPrompt, buildDirectReport, runCouncilConsultation } from '../from_orchestrator/engine/council.ts';
 import type { CouncilRunnerFactory } from '../from_orchestrator/engine/council.ts';
 import { DomainError, classifyFailure } from '../from_orchestrator/engine/failures.ts';
 import { validateCouncilContext } from '../from_orchestrator/mcp/contextValidation.ts';
@@ -47,41 +47,17 @@ test('analysis prompt requires evidence-linked findings and preserves source bou
   assert.match(prompt, /CALLER CONTEXT NOTES:\nCaller notes/);
 });
 
-test('consolidation prompt asks for an anonymous action-oriented report', () => {
-  const prompt = buildCouncilConsolidationPrompt({
-    question: 'How should this be implemented?',
-    analyses: [
-      { provider: 'mock', taskId: 'task1', response: 'Use a small wrapper.' }
-    ]
-  });
+test('buildDirectReport formats each member response under a numbered heading', () => {
+  const report = buildDirectReport([
+    { provider: 'mock', taskId: 'task1', response: 'Use a small wrapper.' },
+    { provider: 'gemini', taskId: 'task2', response: 'Use a decorator pattern.' }
+  ]);
 
-  assert.match(prompt, /Do not include provider names/);
-  assert.match(prompt, /Recommendation, Options, Risks, Implementation Notes, Tests, Open Questions/);
-  assert.doesNotMatch(prompt, /FROM \[MOCK\]/);
-});
-
-test('consolidation prompt includes repository evidence and unsupported-claim handling when context is supplied', () => {
-  const context = validateCouncilContext({
-    files: [{
-      path: 'virtual.ts',
-      content: 'export const value = 1;',
-      relevance: 'minimal fixture'
-    }]
-  }, 'Review this file.');
-
-  const prompt = buildCouncilConsolidationPrompt({
-    question: 'Review this file.',
-    analyses: [
-      { provider: 'mock', taskId: 'task1', response: 'Invented finding in missing.ts.' }
-    ],
-    context
-  });
-
-  assert.match(prompt, /REPOSITORY EVIDENCE FOR VERIFICATION/);
-  assert.match(prompt, /CONTEXT DIGEST:\n[a-f0-9]{64}/);
-  assert.match(prompt, /path=virtual\.ts/);
-  assert.match(prompt, /Retain only findings supported by exact repository evidence/);
-  assert.match(prompt, /Move unsupported claims, invented paths, invented symbols, and unverified test results to Open Questions/);
+  assert.match(report, /## Council Member 1/);
+  assert.match(report, /Use a small wrapper\./);
+  assert.match(report, /## Council Member 2/);
+  assert.match(report, /Use a decorator pattern\./);
+  assert.match(report, /---/);
 });
 
 test('analysis prompt omits optional notes, constraints, and warnings when absent', () => {
@@ -191,51 +167,20 @@ test('runCouncilConsultation bounds provider concurrency', async () => {
   assert.equal(maxActive, 2);
 });
 
-test('runCouncilConsultation uses a fresh tab for same-provider consolidation', async () => {
+test('runCouncilConsultation report contains each provider response directly', async () => {
   initSchema();
   const context = validateCouncilContext({
     files: [{ path: 'virtual.ts', content: 'export const value = 1;' }]
   }, 'Review this file.');
 
-  const fakeBrowser = { close: async () => {} } as any;
-  const fakeContext = { close: async () => {} } as any;
-  const fakeAnalysisPage = {
-    isClosed: () => false,
-    close: async () => {}
-  } as any;
-
-  let analysisPoolItem: any;
-  let consolidationPoolItem: any;
-  let consolidationSnapshot: any;
-  let analysisPageAtSetup: any;
-  const originalConsolidatorProvider = process.env.COUNCIL_CONSOLIDATOR_PROVIDER;
-  process.env.COUNCIL_CONSOLIDATOR_PROVIDER = 'chatgpt';
   const runnerFactory: CouncilRunnerFactory = ({ runId, taskId, provider }) => ({
-    async executeTask(prompt, poolItem, options) {
+    async executeTask(prompt, _poolItem, options) {
       getDB().prepare(`
         INSERT INTO Tasks (task_id, run_id, provider_name, prompt_payload, status, attempt_no)
         VALUES (?, ?, ?, ?, 'IN_PROGRESS', ?)
       `).run(taskId, runId, provider, prompt, options?.attemptNo ?? 1);
 
-      if (taskId.includes('consolidation')) {
-        consolidationPoolItem = poolItem;
-        consolidationSnapshot = {
-          browser: poolItem?.browser,
-          context: poolItem?.context,
-          page: poolItem?.page
-        };
-      } else if (provider === 'chatgpt') {
-        analysisPoolItem = poolItem;
-        poolItem!.browser = fakeBrowser;
-        poolItem!.context = fakeContext;
-        poolItem!.page = fakeAnalysisPage;
-        poolItem!.ownsBrowser = true;
-        poolItem!.ownsContext = true;
-        poolItem!.ownsPage = true;
-        analysisPageAtSetup = poolItem!.page;
-      }
-
-      const response = taskId.includes('consolidation') ? 'consolidated report' : `analysis from ${provider}`;
+      const response = `analysis from ${provider}`;
       getDB().prepare(`
         UPDATE Tasks
         SET response_text = ?, extraction_method = 'api', status = 'COMPLETED'
@@ -246,29 +191,17 @@ test('runCouncilConsultation uses a fresh tab for same-provider consolidation', 
     async close() {}
   });
 
-  let result;
-  try {
-    result = await runCouncilConsultation({
-      question: 'Review this file.',
-      context,
-      providers: ['chatgpt'],
-      maxRetries: 0,
-      runnerFactory
-    });
-  } finally {
-    if (originalConsolidatorProvider === undefined) {
-      delete process.env.COUNCIL_CONSOLIDATOR_PROVIDER;
-    } else {
-      process.env.COUNCIL_CONSOLIDATOR_PROVIDER = originalConsolidatorProvider;
-    }
-  }
+  const result = await runCouncilConsultation({
+    question: 'Review this file.',
+    context,
+    providers: ['mock'],
+    maxRetries: 0,
+    runnerFactory
+  });
 
   assert.equal(result.status, 'COMPLETED');
-  assert.notEqual(consolidationPoolItem, analysisPoolItem);
-  assert.equal(consolidationSnapshot.browser, fakeBrowser);
-  assert.equal(consolidationSnapshot.context, fakeContext);
-  assert.equal(consolidationSnapshot.page, null);
-  assert.equal(analysisPageAtSetup, fakeAnalysisPage);
+  assert.match(result.report, /## Council Member 1/);
+  assert.match(result.report, /analysis from mock/);
 });
 
 test('runCouncilConsultation retries classified transient pre-dispatch failures', async () => {
@@ -304,7 +237,7 @@ test('runCouncilConsultation retries classified transient pre-dispatch failures'
         throw err;
       }
 
-      const response = taskId.includes('consolidation') ? 'consolidated report' : 'provider analysis';
+      const response = 'provider analysis';
       getDB().prepare(`
         UPDATE Tasks
         SET response_text = ?, extraction_method = 'api', status = 'COMPLETED'
