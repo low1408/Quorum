@@ -7,7 +7,9 @@ dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const rootDir = path.resolve(__dirname, '../../');
+const rootDir = process.env.COUNCIL_WORKSPACE_ROOT
+  ? path.resolve(process.env.COUNCIL_WORKSPACE_ROOT)
+  : process.cwd();
 
 export const config = {
   encryptionKey: process.env.ENCRYPTION_KEY || 'default_fallback_secret_key_32_chars_long',
