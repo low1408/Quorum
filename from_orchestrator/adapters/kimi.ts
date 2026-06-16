@@ -1,5 +1,6 @@
 import type { Page } from 'playwright';
 import { BaseBrowserAdapter } from './baseBrowser.ts';
+import type { BrowserOperationOptions } from './base.ts';
 
 /**
  * Kimi-specific browser automation adapter.
@@ -175,7 +176,27 @@ export class KimiAdapter extends BaseBrowserAdapter {
    * as most other providers. Avoid the shared "send button is visible again"
    * shortcut because it can fire before Kimi has rendered a new answer.
    */
-  public override async awaitNetworkCompletion(page: Page): Promise<void> {
+  public override async awaitNetworkCompletion(page: Page, options: BrowserOperationOptions = {}): Promise<void> {
+    const outputStabilizationMs = options.outputStabilizationMs ?? 180_000;
+    const firstTokenMs = options.firstTokenMs ?? 60_000;
+    const startedAt = Date.now();
+
+    const elapsed = () => Date.now() - startedAt;
+    const deadlineExceeded = () => elapsed() >= outputStabilizationMs;
+
+    const throwIfAborted = () => {
+      if (options.signal?.aborted) {
+        const err = new Error(
+          options.signal.reason instanceof Error
+            ? options.signal.reason.message
+            : 'Operation cancelled.'
+        );
+        err.name = 'AbortError';
+        (err as any).code = 'CANCELLED';
+        throw err;
+      }
+    };
+
     const initialSnapshot = await this.getVisibleResponseSnapshot(page);
     this._lastResponseStartIndex = Math.max(0, initialSnapshot.count);
 
@@ -184,8 +205,11 @@ export class KimiAdapter extends BaseBrowserAdapter {
     let sawNewResponse = false;
     let sawStopControl = false;
     let stopGoneStableCount = 0;
+    let iteration = 0;
 
-    for (let i = 0; i < 180; i++) {
+    while (!deadlineExceeded()) {
+      throwIfAborted();
+
       const snapshot = await this.getVisibleResponseSnapshot(page);
       const stopActive = await this.isKimiStopActive(page);
       const text = snapshot.text;
@@ -204,6 +228,12 @@ export class KimiAdapter extends BaseBrowserAdapter {
         console.log(`[STREAMING] ${this.providerId.toUpperCase()} response appeared.`);
       }
 
+      if (!sawNewResponse && elapsed() > firstTokenMs) {
+        console.warn(`[STREAMING] ${this.providerId.toUpperCase()} first token timed out after ${firstTokenMs}ms.`);
+        await this.logCompletionDiagnostics(page);
+        return;
+      }
+
       if (sawNewResponse) {
         if (sawStopControl) {
           if (!stopActive) {
@@ -220,21 +250,40 @@ export class KimiAdapter extends BaseBrowserAdapter {
         if (!stopActive && text === lastText && hasMeaningfulText) {
           stableCount++;
           if (stableCount >= 8) {
-            console.log(`[STREAMING] ${this.providerId.toUpperCase()} response stabilized.`);
+            console.log(`[STREAMING] ${this.providerId.toUpperCase()} response stabilized (${elapsed()}ms).`);
             return;
           }
         } else {
           stableCount = 0;
           lastText = text;
         }
-      } else if (i > 0 && i % 8 === 0) {
-        console.log(`[STREAMING] Waiting for ${this.providerId.toUpperCase()} response to appear...`);
+      } else if (iteration > 0 && iteration % 8 === 0) {
+        console.log(`[STREAMING] Waiting for ${this.providerId.toUpperCase()} response to appear... (${elapsed()}ms elapsed)`);
       }
 
-      await page.waitForTimeout(500);
+      await Promise.race([
+        page.waitForTimeout(500),
+        new Promise<void>((_, reject) => {
+          if (!options.signal) return;
+          const onAbort = () => {
+            options.signal?.removeEventListener('abort', onAbort);
+            const err = new Error(
+              options.signal?.reason instanceof Error
+                ? options.signal.reason.message
+                : 'Operation cancelled.'
+            );
+            err.name = 'AbortError';
+            (err as any).code = 'CANCELLED';
+            reject(err);
+          };
+          options.signal.addEventListener('abort', onAbort, { once: true });
+        })
+      ]);
+
+      iteration++;
     }
 
-    console.warn(`[STREAMING] ${this.providerId.toUpperCase()} completion wait timed out; extracting latest visible response candidate.`);
+    console.warn(`[STREAMING] ${this.providerId.toUpperCase()} completion wait timed out after ${outputStabilizationMs}ms; extracting latest visible response candidate.`);
     await this.logCompletionDiagnostics(page);
   }
 
