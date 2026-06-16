@@ -2,4 +2,8 @@ node_modules/
 orchestrator.db
 sessions/
 quorum/
+review-context/
 *.log
+.agents
+.codex
+.env
