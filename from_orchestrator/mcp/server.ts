@@ -5,9 +5,11 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { initSchema } from '../db/database.ts';
 import { runCouncilConsultation } from '../engine/council.ts';
+import { runMcqConsultation } from '../engine/mcq.ts';
 import { validateCouncilContext } from './contextValidation.ts';
 import { SUPPORTED_PROVIDER_IDS, validateProviderList } from '../adapters/registry.ts';
 import { saveCouncilReportArtifact } from './reportArtifact.ts';
+import { saveMcqReportArtifact } from './mcqReportArtifact.ts';
 
 const contextFileSchema = z.object({
   path: z.string(),
@@ -89,6 +91,92 @@ server.registerTool(
     if (artifact) {
       const memberList = artifact.memberPaths.map(m => `  - ${m.provider}: ${m.relativePath}`).join('\n');
       console.error(`[INFO] Council run saved to ${artifact.relativePath}\n${memberList}`);
+    }
+
+    const response = artifact ? { ...result, artifact } : result;
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response, null, 2)
+        }
+      ],
+      structuredContent: response
+    };
+  }
+);
+
+// ── MCQ Voting Tool ──
+
+const mcqOptionSchema = z.object({
+  id: z.string().min(1),
+  label: z.string().min(1),
+  description: z.string().optional()
+});
+
+const mcqCriterionSchema = z.object({
+  id: z.string().min(1),
+  label: z.string().min(1),
+  description: z.string().optional(),
+  weight: z.number().positive().optional()
+});
+
+const consultCouncilMcqSchema = {
+  question: z.string().min(1),
+  options: z.array(mcqOptionSchema).min(2).max(10),
+  criteria: z.array(mcqCriterionSchema).optional(),
+  context: z.object({
+    files: z.array(contextFileSchema).optional(),
+    notes: z.string().optional()
+  }).optional(),
+  providers: z.array(z.string().min(1)).optional().superRefine((providers, ctx) => {
+    if (!providers) return;
+    try {
+      validateProviderList(providers, 'MCQ providers');
+    } catch (err: any) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: err?.message || `Supported providers: ${SUPPORTED_PROVIDER_IDS.join(', ')}`
+      });
+    }
+  }),
+  max_wait_ms: z.number().int().positive().optional(),
+  provider_timeout_ms: z.number().int().positive().optional(),
+  max_concurrency: z.number().int().positive().optional(),
+  max_retries: z.number().int().min(0).optional()
+};
+
+server.registerTool(
+  'consult_council_mcq',
+  {
+    title: 'Council MCQ Vote',
+    description: 'Ask the LLM council to vote on predefined options. Each council member independently selects one option and provides justification. Returns the full vote distribution for human review — no winner is declared. Optionally provide evaluation criteria for structured per-option scoring.',
+    inputSchema: consultCouncilMcqSchema
+  },
+  async (args) => {
+    initSchema();
+
+    const result = await runMcqConsultation({
+      question: args.question,
+      options: args.options,
+      criteria: args.criteria,
+      context: args.context,
+      providers: args.providers,
+      maxWaitMs: args.max_wait_ms,
+      providerTimeoutMs: args.provider_timeout_ms,
+      maxConcurrency: args.max_concurrency,
+      maxRetries: args.max_retries
+    });
+
+    const artifact = await saveMcqReportArtifact(result).catch((err) => {
+      console.error('[WARN] Failed to save MCQ report artifact:', err?.message ?? err);
+      return null;
+    });
+
+    if (artifact) {
+      const memberList = artifact.memberPaths.map(m => `  - ${m.provider}: ${m.relativePath}`).join('\n');
+      console.error(`[INFO] MCQ vote saved to ${artifact.relativePath}\n${memberList}`);
     }
 
     const response = artifact ? { ...result, artifact } : result;
