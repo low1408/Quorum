@@ -2,8 +2,10 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-// Load .env
-dotenv.config();
+// Keep test runs hermetic; package scripts set the required test env explicitly.
+if (process.env.NODE_ENV !== 'test') {
+  dotenv.config();
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -18,6 +20,9 @@ export const config = {
   cdpEndpoint: process.env.CDP_ENDPOINT || '',
   evaluatorProvider: process.env.EVALUATOR_PROVIDER || 'gemini',
   enableSummaryEvaluation: false,
+  enableCouncilEvaluation: process.env.ENABLE_COUNCIL_EVALUATION !== 'false',
+  councilEvaluationMode: process.env.COUNCIL_EVALUATION_MODE || 'inline',
+  councilEvaluationVersion: process.env.COUNCIL_EVALUATION_VERSION || 'deterministic-v1',
   humanTyping: process.env.HUMAN_TYPING !== 'false',
   chatgptBaseUrl: process.env.CHATGPT_BASE_URL || 'https://chatgpt.com',
   sessionStorageDir: path.resolve(rootDir, './sessions'),

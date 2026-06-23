@@ -189,6 +189,26 @@ ON CouncilEvaluationRuns(run_id, evaluation_version, trigger)
 WHERE trigger = 'inline';
 ```
 
+Indexes:
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_council_eval_runs_run_id
+ON CouncilEvaluationRuns(run_id);
+
+CREATE INDEX IF NOT EXISTS idx_council_eval_runs_tool_call_id
+ON CouncilEvaluationRuns(tool_call_id);
+
+CREATE INDEX IF NOT EXISTS idx_council_eval_runs_run_status
+ON CouncilEvaluationRuns(run_id, status, completed_at);
+```
+
+Relationship and latest semantics:
+
+- `Runs` to `CouncilEvaluationRuns` is one-to-many: manual re-runs, new evaluation versions, and future judge configurations should create distinct evaluation executions.
+- Do not add a global unique constraint on `run_id`.
+- For V1, derive latest evaluation by `completed_at DESC, created_at DESC` scoped to `(run_id, mode)` or `(run_id, mode, evaluation_version)`.
+- Add `is_latest` only if a later UI/query path needs it; if added, enforce it with a partial unique index such as `UNIQUE(run_id, mode) WHERE is_latest = 1`.
+
 ### 3. `ContextQualityMetrics`
 
 Purpose: store intrinsic and hindsight context metrics. Hindsight fields should be nullable when no responses are available.
@@ -219,6 +239,8 @@ CREATE TABLE IF NOT EXISTS ContextQualityMetrics (
 );
 ```
 
+`evaluation_id` is the primary key, so SQLite already indexes this child foreign key. Do not add a duplicate index unless the table changes to one-to-many rows per evaluation.
+
 ### 4. `CouncilDiversityMetrics`
 
 Purpose: aggregate diversity metrics for a council run.
@@ -247,6 +269,14 @@ CREATE TABLE IF NOT EXISTS CouncilDiversityMetrics (
   metrics_json TEXT
 );
 ```
+
+`evaluation_id` is the primary key, so SQLite already indexes this child foreign key. Do not add a duplicate index unless the table changes to one-to-many rows per evaluation.
+
+Metric storage rule:
+
+- Keep operational fields and stable, commonly filtered scorecard fields as columns.
+- Store volatile, experimental, provider-specific, or high-cardinality metric details in `metrics_json`.
+- When a JSON metric becomes a frequent filter/sort key, add a SQLite expression index or generated column explicitly.
 
 ### 5. Optional Detail Tables
 
@@ -478,6 +508,8 @@ Definition of done:
 
 - Every persisted metric row ties back to an `evaluation_id` and `run_id`.
 - Evaluation status is independent of run status.
+- Non-primary-key foreign keys used for joins have explicit indexes.
+- Latest evaluation reads are deterministic without requiring `run_id` to be unique.
 
 ## Phase 5: Inline Council Integration
 
@@ -839,8 +871,9 @@ V1 is complete when:
 2. Should inline evaluation be enabled by default or gated behind `ENABLE_COUNCIL_EVALUATION=true` until stable?
 3. Should manual `evaluate_council_run` create a new evaluation row every time, or deduplicate by `(run_id, evaluation_version, trigger)`?
 4. Should report artifacts include only summary metrics or also link to JSON detail files?
-5. What minimum parse compliance should be required before using finding-level metrics instead of response-level metrics?
-6. What human-labeled fixture set will be used before adding LLM judge scores?
+5. Should latest evaluation remain timestamp-derived, or does a UI/query path need an enforced `is_latest` flag?
+6. What minimum parse compliance should be required before using finding-level metrics instead of response-level metrics?
+7. What human-labeled fixture set will be used before adding LLM judge scores?
 
 ---
 

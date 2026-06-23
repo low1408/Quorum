@@ -174,6 +174,22 @@ config_json TEXT,
 error_json TEXT
 ```
 
+Relationship:
+
+- `Runs` to `CouncilEvaluationRuns` is one-to-many. A run may be evaluated multiple times with different evaluation versions, triggers, or future judge configurations.
+- Do not make `run_id` globally unique. Deduplicate narrowly, such as `(run_id, evaluation_version, trigger)` for inline evaluation if repeat inline evaluation should be idempotent.
+- The latest/active evaluation should be derived from timestamps for V1, or represented later with an explicit `is_latest` invariant if a UI or query path needs it.
+
+Indexes:
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_council_eval_runs_run_id
+ON CouncilEvaluationRuns(run_id);
+
+CREATE INDEX IF NOT EXISTS idx_council_eval_runs_run_status
+ON CouncilEvaluationRuns(run_id, status, completed_at);
+```
+
 ### `ContextQualityMetrics`
 ```sql
 evaluation_id TEXT PRIMARY KEY REFERENCES CouncilEvaluationRuns(evaluation_id),
@@ -187,6 +203,8 @@ unused_evidence_rate REAL,
 metrics_json TEXT                 -- extensible overflow
 ```
 
+`evaluation_id` is a primary key here, so SQLite already indexes it. Add a separate foreign-key index only if this table later changes to one-to-many rows per evaluation.
+
 ### `CouncilDiversityMetrics`
 ```sql
 evaluation_id TEXT PRIMARY KEY REFERENCES CouncilEvaluationRuns(evaluation_id),
@@ -199,6 +217,14 @@ category_entropy REAL, evidence_path_breadth INTEGER,
 provider_incremental_coverage_json TEXT,
 metrics_json TEXT
 ```
+
+`evaluation_id` is also a primary key here and does not need a duplicate foreign-key index.
+
+Metric storage rule:
+
+- Keep operational fields and stable, commonly filtered scorecard fields as columns.
+- Put volatile, experimental, provider-specific, or high-cardinality details in `metrics_json`.
+- If a JSON metric becomes a hot query path, add an expression index or generated column intentionally rather than promoting every metric to a column by default.
 
 ### Optional Detail Tables
 - `CouncilResponsePairMetrics` — per task-pair ROUGE/similarity
