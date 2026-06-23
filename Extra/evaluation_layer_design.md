@@ -211,7 +211,11 @@ metrics_json TEXT
 ## 6. Execution Strategy
 
 > [!IMPORTANT]
-> **Post-hoc by default.** Blocking council results on evaluation adds latency and makes successful consultations fail due to auxiliary evaluation failures.
+> **Inline deterministic evaluation by default.** Quorum runs as an MCP server, and MCP clients may suspend or terminate the server process as soon as the tool response is returned. Do not rely on fire-and-forget promises or process-lifetime background work for evaluation persistence.
+
+The V1 evaluation path should be synchronous from the MCP tool's perspective: after council responses are persisted, run the cheap deterministic evaluation steps, persist their status, then return the tool response. Evaluation errors must not fail an otherwise successful consultation; catch them, persist `FAILED` or `PARTIAL` evaluation status where possible, and include an evaluation warning in the response.
+
+For inline evaluation, prefer computing metrics first and persisting the evaluation row with a terminal status (`COMPLETED`, `PARTIAL`, `FAILED`, or `SKIPPED`) in the same awaited path. `PENDING` should be reserved for durable queued work that has a worker or manual resume path.
 
 ### Recommended execution flow:
 
@@ -221,16 +225,19 @@ graph TD
     B --> C["Intrinsic Snapshot (cheap, deterministic)"]
     C --> D[Council Execution]
     D --> E[Persist Responses]
-    E --> F["Return Report ✅"]
-    E --> G["Post-hoc Evaluation (async)"]
-    G --> H[Finding Extraction]
-    G --> I[Pairwise ROUGE]
-    G --> J[Clustering]
-    G --> K["Optional LLM Judge"]
-    H & I & J & K --> L[Persist Evaluation Metrics]
+    E --> F["Inline Evaluation (blocking)"]
+    F --> G[Finding Extraction]
+    F --> H[Pairwise ROUGE]
+    F --> I[Clustering]
+    G & H & I --> J[Persist Evaluation Metrics]
+    J --> K["Return Report ✅"]
 ```
 
-- **Inline mode** available for CI/benchmarking: `evaluationMode: 'inline' | 'posthoc' | 'disabled'`
+- Supported V1 modes: `evaluationMode: 'inline' | 'disabled'`
+- Reserve `posthoc` for a future durable worker/queue or explicit manual MCP tool such as `evaluate_council_run`
+- If `posthoc` is added, it must enqueue durable work before returning; it must not schedule detached JavaScript promises
+- Inline evaluation must not return a tool response after writing only `PENDING`
+- Optional LLM judge evaluation belongs outside the V1 inline path unless it is explicitly requested and acceptable as blocking work
 - Evaluation status (`PENDING`/`COMPLETED`/`FAILED`) is independent of consultation status
 
 ---
@@ -264,7 +271,7 @@ graph TD
 | 3 | Pairwise lexical metrics + finding clustering | ❌ |
 | 4 | New DB tables + persistence | ❌ |
 | 5 | JSON evaluation artifact + report section | ❌ |
-| 6 | Post-hoc execution without changing consultation status | ❌ |
+| 6 | Inline MCP integration without changing consultation status | ❌ |
 | 7 | Optional semantic embeddings + LLM judges | ✅ |
 | 8 | Calibrate against human-labeled corpus | ✅ |
 
@@ -278,5 +285,5 @@ graph TD
 1. **Should `contextValidation.ts` be refactored to return structured warning objects?** (vs. parsing strings)
 2. **Should `CouncilConsultationResult` be extended with a structured `contextEvaluation` field?** (vs. warnings-only)
 3. **O(N²) avoidance:** Use ROUGE pairwise (deterministic, cheap) or single-call LLM clustering for diversity?
-4. **Durable post-hoc execution:** Is the current process lifecycle sufficient, or does this need a worker/queue?
+4. **Durable post-hoc execution:** Resolved for V1: inline only. Future post-hoc execution needs a durable worker/queue or manual MCP tool, not process-lifetime background promises.
 5. **Evaluation as its own MCP tool?** (e.g., `evaluate_council_run` to re-run evaluation on past runs)

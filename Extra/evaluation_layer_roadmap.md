@@ -69,6 +69,7 @@ Included:
 Only after V1 and V1.1 are stable:
 
 - Add durable queue or DAG-backed evaluation execution.
+- If a `PENDING` evaluation row is created before returning a tool response, a durable worker or explicit manual resume path must own it.
 - Add optional LLM judge with strict JSON output.
 - Add optional embeddings with frozen model/version metadata.
 - Add calibration set and human-labeled benchmark workflow.
@@ -486,7 +487,7 @@ Implementation:
 
 - In `server.ts`, pass `toolCallId` into `runCouncilConsultation` or attach evaluation after result returns.
 - In `council.ts`, preserve the normal result path.
-- After analyses are available, call `evaluateCouncilRun`.
+- After analyses are available, `await evaluateCouncilRun` before returning the MCP tool response.
 - Catch evaluation errors and turn them into evaluation warnings instead of throwing from the council request.
 - Add optional result field:
 
@@ -514,6 +515,8 @@ Tests:
 Definition of done:
 
 - `consult_council` reports evaluation data without making evaluation a critical path failure.
+- No detached promises or process-lifetime background work are used for V1 evaluation.
+- Inline evaluation returns only after persisting a terminal evaluation status; it does not leave `PENDING` work behind.
 
 ## Phase 6: Finding Extraction MVP
 
