@@ -7,6 +7,7 @@ import { z } from 'zod';
 import { DBService, initSchema } from '../db/database.ts';
 import { runCouncilConsultation, uniqueProviders } from '../engine/council.ts';
 import { runMcqConsultation } from '../engine/mcq.ts';
+import { runMaterializeValidationTests, selectValidationTestProvider } from '../engine/validationTests.ts';
 import { validateCouncilContext } from './contextValidation.ts';
 import { saveCouncilReportArtifact } from './reportArtifact.ts';
 import { saveMcqReportArtifact } from './mcqReportArtifact.ts';
@@ -192,6 +193,29 @@ const consultCouncilMcqSchema = {
   max_retries: z.number().int().min(0).optional()
 };
 
+const validationTestFindingSchema = z.object({
+  id: z.string().min(1).optional(),
+  classification: z.string().min(1).optional(),
+  severity: z.string().min(1).optional(),
+  description: z.string().min(1),
+  evidence: z.string().min(1).optional(),
+  validation_test: z.string().min(1)
+});
+
+const materializeValidationTestsSchema = {
+  objective: z.string().min(1),
+  findings: z.array(validationTestFindingSchema).min(1),
+  context: z.object({
+    files: z.array(contextFileSchema).min(1)
+  }),
+  test_framework: z.enum(['auto', 'node:test', 'vitest', 'jest', 'pytest']).optional(),
+  target_test_dir: z.string().min(1).optional(),
+  style_constraints: z.string().optional(),
+  provider: z.string().min(1).optional(),
+  max_wait_ms: z.number().int().positive().optional(),
+  provider_timeout_ms: z.number().int().positive().optional()
+};
+
 export async function handleConsultCouncilMcq(args: any): Promise<ToolResponse> {
   initSchema();
 
@@ -287,6 +311,96 @@ server.registerTool(
     inputSchema: consultCouncilMcqSchema
   },
   handleConsultCouncilMcq
+);
+
+export async function handleMaterializeValidationTests(args: any): Promise<ToolResponse> {
+  initSchema();
+
+  const startedAt = Date.now();
+  const toolCallId = createToolCallId('materialize_validation_tests');
+  DBService.createMcpToolCallMetric({
+    toolCallId,
+    toolName: 'materialize_validation_tests',
+    requestedProviderCount: args.provider ? 1 : 0
+  });
+
+  let requestedProviderCount = args.provider ? 1 : 0;
+  let contextDigest: string | null = null;
+
+  try {
+    const provider = selectValidationTestProvider(args.provider);
+    requestedProviderCount = 1;
+    const validatedContext = validateCouncilContext(args.context, args.objective);
+    contextDigest = validatedContext.context_digest;
+
+    const result = await runMaterializeValidationTests({
+      objective: args.objective,
+      findings: args.findings,
+      context: validatedContext,
+      test_framework: args.test_framework,
+      target_test_dir: args.target_test_dir,
+      style_constraints: args.style_constraints,
+      provider,
+      max_wait_ms: args.max_wait_ms,
+      provider_timeout_ms: args.provider_timeout_ms,
+      runnerFactory: args.runnerFactory
+    });
+
+    if (result.status === 'FAILED') {
+      DBService.failMcpToolCallMetric({
+        toolCallId,
+        status: 'FAILED',
+        requestedProviderCount,
+        successfulProviderCount: 0,
+        failedProviderCount: 1,
+        durationMs: Date.now() - startedAt,
+        contextDigest,
+        errorMessage: 'Validation-test materialization failed.'
+      });
+    } else {
+      DBService.completeMcpToolCallMetric({
+        toolCallId,
+        status: result.status === 'PARTIAL' ? 'PARTIAL_SUCCESS' : 'COMPLETED',
+        requestedProviderCount,
+        successfulProviderCount: 1,
+        failedProviderCount: 0,
+        durationMs: Date.now() - startedAt,
+        contextDigest
+      });
+    }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(result, null, 2)
+        }
+      ],
+      structuredContent: result
+    };
+  } catch (err: any) {
+    DBService.failMcpToolCallMetric({
+      toolCallId,
+      status: contextDigest ? failedMetricStatus(err) : 'VALIDATION_FAILED',
+      requestedProviderCount,
+      successfulProviderCount: 0,
+      failedProviderCount: requestedProviderCount,
+      durationMs: Date.now() - startedAt,
+      contextDigest,
+      errorMessage: errorMessage(err)
+    });
+    throw err;
+  }
+}
+
+server.registerTool(
+  'materialize_validation_tests',
+  {
+    title: 'Materialize Validation Tests',
+    description: 'Convert structured council findings and validation-test prose into a patch-only executable test diff. The tool returns generated tests as metadata and never writes files.',
+    inputSchema: materializeValidationTestsSchema
+  },
+  handleMaterializeValidationTests
 );
 
 async function main(): Promise<void> {
