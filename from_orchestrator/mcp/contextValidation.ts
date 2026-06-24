@@ -121,7 +121,7 @@ const EVIDENCE_ROLES = new Set<CouncilEvidenceRole>(['core', 'contract', 'config
 const EVIDENCE_PROVENANCE = new Set<CouncilEvidenceProvenance>(['repository', 'generated', 'test-runtime', 'caller-supplied']);
 const TEXT_FIELD_MAX_CHARS = 50_000;
 
-function normalizeContextPath(rawPath: string): string {
+export function normalizeContextPath(rawPath: string): string {
   if (typeof rawPath !== 'string' || rawPath.trim() === '') {
     throw new Error('Context file path must be a non-empty string.');
   }
@@ -222,7 +222,7 @@ function validateOptionalBoolean(value: unknown, label: string): boolean | undef
   return value;
 }
 
-function assertSafeContextPath(normalizedPath: string): void {
+export function assertSafeContextPath(normalizedPath: string): void {
   const lower = normalizedPath.toLowerCase();
   const basename = path.posix.basename(lower);
   const safeEnvExamples = new Set(['.env.example', 'env.example']);
@@ -279,7 +279,7 @@ function validateStructuredReviewContext(context: CouncilContext, warnings: stri
   return structured;
 }
 
-function referencedRepositoryPaths(text: string): string[] {
+export function referencedRepositoryPaths(text: string): string[] {
   return text.match(/[A-Za-z0-9_./-]+\.(?:ts|tsx|js|jsx|json|md|yml|yaml)/g) || [];
 }
 
@@ -367,7 +367,7 @@ function contextDigest(params: {
   return sha256(JSON.stringify(payload));
 }
 
-function candidateImportPaths(content: string): string[] {
+export function candidateImportPaths(content: string): string[] {
   const candidates = new Set<string>();
   const patterns = [
     /\bfrom\s+['"]([^'"]+)['"]/g,
@@ -388,7 +388,7 @@ function candidateImportPaths(content: string): string[] {
   return Array.from(candidates);
 }
 
-function resolveLikelyImportPath(fromFile: string, importPath: string): string[] {
+export function resolveLikelyImportPath(fromFile: string, importPath: string): string[] {
   const base = path.posix.normalize(path.posix.join(path.posix.dirname(fromFile), importPath));
   const extensions = ['', '.ts', '.tsx', '.js', '.jsx', '.json'];
   return extensions.flatMap(ext => [

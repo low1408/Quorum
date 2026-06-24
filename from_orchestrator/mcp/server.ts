@@ -8,6 +8,7 @@ import { DBService, initSchema } from '../db/database.ts';
 import { runCouncilConsultation, uniqueProviders } from '../engine/council.ts';
 import { runMcqConsultation } from '../engine/mcq.ts';
 import { runMaterializeValidationTests, selectValidationTestProvider } from '../engine/validationTests.ts';
+import { discoverScoutContext } from '../tools/scout.ts';
 import { validateCouncilContext } from './contextValidation.ts';
 import { saveCouncilReportArtifact } from './reportArtifact.ts';
 import { saveMcqReportArtifact } from './mcqReportArtifact.ts';
@@ -17,7 +18,11 @@ const contextFileSchema = z.object({
   content: z.string(),
   sha256: z.string().optional(),
   modified_at: z.string().optional(),
-  relevance: z.string().optional()
+  relevance: z.string().optional(),
+  start_line: z.number().int().positive().optional(),
+  end_line: z.number().int().positive().optional(),
+  total_lines: z.number().int().positive().optional(),
+  is_excerpt: z.boolean().optional()
 });
 
 const structuredReviewSchema = z.object({
@@ -32,19 +37,48 @@ const structuredReviewSchema = z.object({
   omitted_material: z.string()
 });
 
+const evidenceManifestItemSchema = z.object({
+  id: z.string().min(1),
+  path: z.string().min(1),
+  sha256: z.string().optional(),
+  role: z.enum(['core', 'contract', 'config', 'test', 'runtime', 'supporting']),
+  provenance: z.enum(['repository', 'generated', 'test-runtime', 'caller-supplied']),
+  relevance: z.string().min(1),
+  order: z.number().int().optional(),
+  start_line: z.number().int().positive().optional(),
+  end_line: z.number().int().positive().optional(),
+  total_lines: z.number().int().positive().optional(),
+  is_excerpt: z.boolean().optional()
+});
+
+const councilContextSchema = z.object({
+  schema_version: z.string().optional(),
+  files: z.array(contextFileSchema).min(1),
+  notes: z.string().optional(),
+  evidence_manifest: z.array(evidenceManifestItemSchema).optional(),
+  structured_review: structuredReviewSchema.optional()
+});
+
 const consultCouncilSchema = {
   question: z.string().min(1),
-  context: z.object({
-    files: z.array(contextFileSchema).min(1),
-    notes: z.string().optional(),
-    structured_review: structuredReviewSchema.optional()
-  }),
+  context: councilContextSchema,
   constraints: z.string().optional(),
   providers: z.array(z.string().min(1)).optional(),
   max_wait_ms: z.number().int().positive().optional(),
   provider_timeout_ms: z.number().int().positive().optional(),
   max_concurrency: z.number().int().positive().optional(),
   max_retries: z.number().int().min(0).optional()
+};
+
+const scoutDiscoverContextSchema = {
+  query: z.string().min(1),
+  repo_root: z.string().optional(),
+  entrypoints: z.array(z.string().min(1)).optional(),
+  changed_files: z.array(z.string().min(1)).optional(),
+  token_budget_chars: z.number().int().positive().optional(),
+  max_dependency_depth: z.number().int().min(0).max(5).optional(),
+  include_tests: z.boolean().optional(),
+  include_reverse_importers: z.boolean().optional()
 };
 
 export const server = new McpServer({
@@ -163,6 +197,60 @@ server.registerTool(
   handleConsultCouncil
 );
 
+export async function handleScoutDiscoverContext(args: any): Promise<ToolResponse> {
+  initSchema();
+
+  const startedAt = Date.now();
+  const toolCallId = createToolCallId('scout_discover_context');
+  DBService.createMcpToolCallMetric({
+    toolCallId,
+    toolName: 'scout_discover_context'
+  });
+
+  let contextDigest: string | null = null;
+
+  try {
+    const result = discoverScoutContext(args);
+    contextDigest = result.context_digest;
+
+    DBService.completeMcpToolCallMetric({
+      toolCallId,
+      status: 'COMPLETED',
+      durationMs: Date.now() - startedAt,
+      contextDigest
+    });
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(result, null, 2)
+        }
+      ],
+      structuredContent: result
+    };
+  } catch (err: any) {
+    DBService.failMcpToolCallMetric({
+      toolCallId,
+      status: 'VALIDATION_FAILED',
+      durationMs: Date.now() - startedAt,
+      contextDigest,
+      errorMessage: errorMessage(err)
+    });
+    throw err;
+  }
+}
+
+server.registerTool(
+  'scout_discover_context',
+  {
+    title: 'Scout Discover Context',
+    description: 'Deterministically discover, rank, budget, and validate repository files into a ready-to-send council context.',
+    inputSchema: scoutDiscoverContextSchema
+  },
+  handleScoutDiscoverContext
+);
+
 // ── MCQ Voting Tool ──
 
 const mcqOptionSchema = z.object({
@@ -183,8 +271,11 @@ const consultCouncilMcqSchema = {
   options: z.array(mcqOptionSchema).min(2).max(10),
   criteria: z.array(mcqCriterionSchema).optional(),
   context: z.object({
+    schema_version: z.string().optional(),
     files: z.array(contextFileSchema).optional(),
-    notes: z.string().optional()
+    notes: z.string().optional(),
+    evidence_manifest: z.array(evidenceManifestItemSchema).optional(),
+    structured_review: structuredReviewSchema.optional()
   }).optional(),
   providers: z.array(z.string().min(1)).optional(),
   max_wait_ms: z.number().int().positive().optional(),
@@ -205,9 +296,7 @@ const validationTestFindingSchema = z.object({
 const materializeValidationTestsSchema = {
   objective: z.string().min(1),
   findings: z.array(validationTestFindingSchema).min(1),
-  context: z.object({
-    files: z.array(contextFileSchema).min(1)
-  }),
+  context: councilContextSchema,
   test_framework: z.enum(['auto', 'node:test', 'vitest', 'jest', 'pytest']).optional(),
   target_test_dir: z.string().min(1).optional(),
   style_constraints: z.string().optional(),
