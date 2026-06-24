@@ -8,7 +8,7 @@ import { DBService, initSchema } from '../db/database.ts';
 import { runCouncilConsultation, uniqueProviders } from '../engine/council.ts';
 import { runMcqConsultation } from '../engine/mcq.ts';
 import { runMaterializeValidationTests, selectValidationTestProvider } from '../engine/validationTests.ts';
-import { discoverScoutContext } from '../tools/scout.ts';
+import { discoverScoutContextWithLlm } from '../tools/scout.ts';
 import { validateCouncilContext } from './contextValidation.ts';
 import { saveCouncilReportArtifact } from './reportArtifact.ts';
 import { saveMcqReportArtifact } from './mcqReportArtifact.ts';
@@ -78,7 +78,9 @@ const scoutDiscoverContextSchema = {
   token_budget_chars: z.number().int().positive().optional(),
   max_dependency_depth: z.number().int().min(0).max(5).optional(),
   include_tests: z.boolean().optional(),
-  include_reverse_importers: z.boolean().optional()
+  include_reverse_importers: z.boolean().optional(),
+  enhance_with_llm: z.boolean().optional(),
+  llm_timeout_ms: z.number().int().positive().optional()
 };
 
 export const server = new McpServer({
@@ -210,11 +212,12 @@ export async function handleScoutDiscoverContext(args: any): Promise<ToolRespons
   let contextDigest: string | null = null;
 
   try {
-    const result = discoverScoutContext(args);
+    const result = await discoverScoutContextWithLlm(args);
     contextDigest = result.context_digest;
 
     DBService.completeMcpToolCallMetric({
       toolCallId,
+      runId: result.stats.llm?.run_id,
       status: 'COMPLETED',
       durationMs: Date.now() - startedAt,
       contextDigest

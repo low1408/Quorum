@@ -2,6 +2,8 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { config } from '../config/index.ts';
+import { OrchestrationRunner, type RunnerTimeoutBudgets } from '../engine/runner.ts';
+import { createCancelledError } from '../engine/statuses.ts';
 import {
   assertSafeContextPath,
   candidateImportPaths,
@@ -15,6 +17,13 @@ import {
 } from '../mcp/contextValidation.ts';
 
 type ScoutRole = Extract<CouncilEvidenceRole, 'core' | 'contract' | 'config' | 'test' | 'supporting'>;
+type LlmPhase = 'ranking' | 'briefing';
+
+export type ScoutStrategy =
+  | 'deterministic-v1'
+  | 'chatgpt-full-briefing-v1'
+  | 'chatgpt-partial-v1'
+  | 'chatgpt-fallback-v1';
 
 export type ScoutDiscoverContextArgs = {
   query: string;
@@ -25,6 +34,8 @@ export type ScoutDiscoverContextArgs = {
   max_dependency_depth?: number;
   include_tests?: boolean;
   include_reverse_importers?: boolean;
+  enhance_with_llm?: boolean;
+  llm_timeout_ms?: number;
 };
 
 export type ScoutRecommendedFile = {
@@ -50,12 +61,40 @@ export type ScoutDiscoverContextResult = {
   omitted_files: ScoutOmittedFile[];
   warnings: string[];
   stats: {
-    strategy: 'deterministic-v1';
+    strategy: ScoutStrategy;
     candidate_count: number;
     selected_count: number;
     total_chars: number;
     token_budget_chars: number;
+    llm?: ScoutLlmStats;
   };
+};
+
+export type ScoutLlmStats = {
+  provider: 'chatgpt';
+  attempted: boolean;
+  ranking_applied: boolean;
+  briefing_applied: boolean;
+  run_id?: string;
+  task_ids?: string[];
+  duration_ms: number;
+  fallback_reason?: string;
+};
+
+export type ScoutLlmRunnerParams = {
+  phase: LlmPhase;
+  prompt: string;
+  runId: string;
+  taskId: string;
+  signal: AbortSignal;
+  timeoutMs: number;
+};
+
+export type ScoutLlmRunner = (params: ScoutLlmRunnerParams) => Promise<string>;
+
+export type ScoutLlmDeps = {
+  runLlm?: ScoutLlmRunner;
+  now?: () => number;
 };
 
 type RepoFile = {
@@ -79,7 +118,25 @@ const MAX_CONTEXT_FILE_CHARS = 250_000;
 const DEFAULT_DEPENDENCY_DEPTH = 2;
 const MAX_DEPENDENCY_DEPTH = 5;
 const LEXICAL_CANDIDATE_LIMIT = 8;
+const DEFAULT_LLM_TIMEOUT_MS = 90_000;
+const MIN_LLM_TIMEOUT_MS = 15_000;
+const MAX_LLM_TIMEOUT_MS = 180_000;
+const LLM_BRIEFING_MAX_FILE_EXCERPT_CHARS = 4_000;
+const LLM_BRIEFING_MAX_TOTAL_EXCERPT_CHARS = 40_000;
+const LLM_OMITTED_FILE_LIMIT = 30;
 const SCHEMA_VERSION = '2026-06-14';
+
+const STRUCTURED_REVIEW_FIELDS: Array<keyof NonNullable<CouncilContext['structured_review']>> = [
+  'review_objective',
+  'architecture',
+  'execution_flow',
+  'assumptions_and_invariants',
+  'core_evidence',
+  'supporting_contracts',
+  'privacy_and_persistence',
+  'tests_and_runtime_evidence',
+  'omitted_material'
+];
 
 const STOP_WORDS = new Set([
   'about',
@@ -734,7 +791,22 @@ function repairPathsFromWarnings(warnings: string[], selectedPaths: Set<string>,
   return Array.from(repairPaths).sort();
 }
 
-export function discoverScoutContext(args: ScoutDiscoverContextArgs): ScoutDiscoverContextResult {
+type ScoutWorkingState = {
+  query: string;
+  tokenBudgetChars: number;
+  repoFiles: Map<string, RepoFile>;
+  candidates: Map<string, Candidate>;
+  baseOmissions: Map<string, ScoutOmittedFile>;
+  warnings: string[];
+};
+
+type ScoutFinalizedContext = {
+  selection: ReturnType<typeof selectWithinBudget>;
+  context: CouncilContext;
+  validated: ReturnType<typeof validateCouncilContext>;
+};
+
+function collectScoutContextState(args: ScoutDiscoverContextArgs): ScoutWorkingState {
   const query = args.query;
   validateCouncilRequestText(query);
   assertWorkspaceRoot(args.repo_root);
@@ -819,30 +891,69 @@ export function discoverScoutContext(args: ScoutDiscoverContextArgs): ScoutDisco
   }
   addConfigFiles({ query, candidates, repoFiles, omissions: baseOmissions, warnings });
 
-  let selection = selectWithinBudget({ candidates, repoFiles, tokenBudgetChars, baseOmissions });
-  let context = buildCouncilContext({
+  return {
     query,
+    tokenBudgetChars,
+    repoFiles,
+    candidates,
+    baseOmissions,
+    warnings
+  };
+}
+
+function applyContextOverrides(context: CouncilContext, overrides?: {
+  notes?: string;
+  structuredReview?: CouncilContext['structured_review'];
+}): CouncilContext {
+  if (!overrides) return context;
+  return {
+    ...context,
+    notes: overrides.notes ?? context.notes,
+    structured_review: overrides.structuredReview ?? context.structured_review
+  };
+}
+
+function buildContextForSelection(state: ScoutWorkingState, selection: ReturnType<typeof selectWithinBudget>, overrides?: {
+  notes?: string;
+  structuredReview?: CouncilContext['structured_review'];
+}): CouncilContext {
+  const context = buildCouncilContext({
+    query: state.query,
     selected: selection.selected,
     omitted: Array.from(selection.omitted.values()),
-    repoFiles,
+    repoFiles: state.repoFiles,
     totalChars: selection.totalChars,
-    tokenBudgetChars
+    tokenBudgetChars: state.tokenBudgetChars
   });
-  let validated = validateCouncilContext(context, query);
+  return applyContextOverrides(context, overrides);
+}
+
+function finalizeScoutContext(state: ScoutWorkingState, overrides?: {
+  notes?: string;
+  structuredReview?: CouncilContext['structured_review'];
+}): ScoutFinalizedContext {
+  let selection = selectWithinBudget({
+    candidates: state.candidates,
+    repoFiles: state.repoFiles,
+    tokenBudgetChars: state.tokenBudgetChars,
+    baseOmissions: state.baseOmissions
+  });
+  let context = buildContextForSelection(state, selection, overrides);
+  let validated = validateCouncilContext(context, state.query);
 
   const repairPaths = repairPathsFromWarnings(
     validated.warnings,
     new Set(selection.selected.map(candidate => candidate.path)),
-    repoFiles
+    state.repoFiles
   );
 
   if (repairPaths.length > 0) {
     for (const repairPath of repairPaths) {
       addCandidate({
-        candidates,
-        repoFiles,
-        omissions: baseOmissions,
-        warnings,
+        candidates: state.candidates,
+        repoFiles: state.repoFiles,
+        omissions: state.baseOmissions,
+        warnings: state.warnings,
         rawPath: repairPath,
         score: 0.5,
         role: classifyRole(repairPath, 'contract'),
@@ -852,30 +963,492 @@ export function discoverScoutContext(args: ScoutDiscoverContextArgs): ScoutDisco
       });
     }
 
-    selection = selectWithinBudget({ candidates, repoFiles, tokenBudgetChars, baseOmissions });
-    context = buildCouncilContext({
-      query,
-      selected: selection.selected,
-      omitted: Array.from(selection.omitted.values()),
-      repoFiles,
-      totalChars: selection.totalChars,
-      tokenBudgetChars
+    selection = selectWithinBudget({
+      candidates: state.candidates,
+      repoFiles: state.repoFiles,
+      tokenBudgetChars: state.tokenBudgetChars,
+      baseOmissions: state.baseOmissions
     });
-    validated = validateCouncilContext(context, query);
+    context = buildContextForSelection(state, selection, overrides);
+    validated = validateCouncilContext(context, state.query);
+  }
+
+  return { selection, context, validated };
+}
+
+function buildScoutResult(params: {
+  state: ScoutWorkingState;
+  finalized: ScoutFinalizedContext;
+  strategy: ScoutStrategy;
+  llm?: ScoutLlmStats;
+  warnings?: string[];
+}): ScoutDiscoverContextResult {
+  const { state, finalized } = params;
+  return {
+    context: finalized.context,
+    context_digest: finalized.validated.context_digest,
+    recommended_files: selectedForOutput([...finalized.selection.selected], state.repoFiles),
+    omitted_files: Array.from(finalized.selection.omitted.values()).sort((a, b) => a.path.localeCompare(b.path)),
+    warnings: dedupeWarnings([...state.warnings, ...finalized.validated.warnings, ...(params.warnings || [])]),
+    stats: {
+      strategy: params.strategy,
+      candidate_count: state.candidates.size,
+      selected_count: finalized.selection.selected.length,
+      total_chars: finalized.selection.totalChars,
+      token_budget_chars: state.tokenBudgetChars,
+      ...(params.llm ? { llm: params.llm } : {})
+    }
+  };
+}
+
+function llmTimeoutMs(args: ScoutDiscoverContextArgs): number {
+  return clampInteger(
+    args.llm_timeout_ms,
+    DEFAULT_LLM_TIMEOUT_MS,
+    MIN_LLM_TIMEOUT_MS,
+    MAX_LLM_TIMEOUT_MS
+  );
+}
+
+function cloneWorkingState(state: ScoutWorkingState): ScoutWorkingState {
+  const candidates = new Map<string, Candidate>();
+  for (const [candidatePath, candidate] of state.candidates.entries()) {
+    candidates.set(candidatePath, {
+      ...candidate,
+      reasons: [...candidate.reasons]
+    });
   }
 
   return {
-    context,
-    context_digest: validated.context_digest,
-    recommended_files: selectedForOutput([...selection.selected], repoFiles),
-    omitted_files: Array.from(selection.omitted.values()).sort((a, b) => a.path.localeCompare(b.path)),
-    warnings: dedupeWarnings([...warnings, ...validated.warnings]),
-    stats: {
-      strategy: 'deterministic-v1',
-      candidate_count: candidates.size,
-      selected_count: selection.selected.length,
-      total_chars: selection.totalChars,
-      token_budget_chars: tokenBudgetChars
-    }
+    query: state.query,
+    tokenBudgetChars: state.tokenBudgetChars,
+    repoFiles: state.repoFiles,
+    candidates,
+    baseOmissions: new Map(state.baseOmissions),
+    warnings: [...state.warnings]
   };
+}
+
+function timeoutController(ms: number): { controller: AbortController; clear: () => void } {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => {
+    controller.abort(createCancelledError(`ChatGPT Scout enhancement timed out after ${ms}ms.`));
+  }, ms);
+  timeout.unref?.();
+  return {
+    controller,
+    clear: () => clearTimeout(timeout)
+  };
+}
+
+function runnerTimeouts(timeoutMs: number): Partial<RunnerTimeoutBudgets> {
+  return {
+    navigationMs: Math.min(15_000, timeoutMs),
+    inputReadyMs: Math.min(10_000, timeoutMs),
+    submissionMs: Math.min(20_000, timeoutMs),
+    firstTokenMs: Math.min(30_000, timeoutMs),
+    outputStabilizationMs: Math.min(60_000, timeoutMs),
+    providerExecutionMs: timeoutMs
+  };
+}
+
+async function defaultScoutLlmRunner(params: ScoutLlmRunnerParams): Promise<string> {
+  const runner = new OrchestrationRunner(params.runId, params.taskId, 'chatgpt', { manageRunStatus: false });
+  try {
+    return await runner.executeTask(params.prompt, undefined, {
+      signal: params.signal,
+      timeouts: runnerTimeouts(params.timeoutMs),
+      attemptNo: 1
+    });
+  } finally {
+    await runner.close().catch(() => {});
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function truncateText(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  return `${value.slice(0, Math.max(0, maxChars - 15))}...[truncated]`;
+}
+
+function unknownErrorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function parseJsonObjectFromLlmResponse(response: string): Record<string, unknown> {
+  const candidates: string[] = [];
+  for (const match of response.matchAll(/```(?:json)?\s*([\s\S]*?)```/giu)) {
+    candidates.push(match[1].trim());
+  }
+
+  const firstBrace = response.indexOf('{');
+  const lastBrace = response.lastIndexOf('}');
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    candidates.push(response.slice(firstBrace, lastBrace + 1));
+  }
+  candidates.push(response.trim());
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    try {
+      const parsed = JSON.parse(candidate);
+      if (isRecord(parsed)) return parsed;
+    } catch {
+      // Try the next plausible JSON span.
+    }
+  }
+
+  throw new Error('ChatGPT response did not contain a valid JSON object.');
+}
+
+type ParsedLlmRankedFile = {
+  path: string;
+  score?: number;
+  reason?: string;
+};
+
+function parseLlmRanking(response: string): ParsedLlmRankedFile[] {
+  const parsed = parseJsonObjectFromLlmResponse(response);
+  const rankedFiles = parsed.ranked_files;
+  if (!Array.isArray(rankedFiles) || rankedFiles.length === 0) {
+    throw new Error('ChatGPT ranking JSON must include a non-empty ranked_files array.');
+  }
+
+  return rankedFiles.map((item, index) => {
+    if (!isRecord(item) || typeof item.path !== 'string' || item.path.trim() === '') {
+      throw new Error(`ChatGPT ranked_files[${index}] must include a non-empty path.`);
+    }
+    const rawScore = item.relevance_score ?? item.score;
+    const score = typeof rawScore === 'number' ? rawScore : undefined;
+    const rawReason = item.relevance_reason ?? item.reason;
+    const reason = typeof rawReason === 'string' && rawReason.trim() ? rawReason.trim() : undefined;
+    return {
+      path: item.path,
+      score,
+      reason
+    };
+  });
+}
+
+function clampedScore(value: number | undefined, fallback: number): number {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.max(0, Math.min(1, value as number));
+}
+
+function pinnedCandidateMinimum(candidate: Candidate): number | undefined {
+  if (candidate.source === 'query_path' || candidate.source === 'entrypoint') return 1;
+  if (candidate.source === 'changed_file') return 0.95;
+  return undefined;
+}
+
+function applyLlmRanking(params: {
+  state: ScoutWorkingState;
+  ranking: ParsedLlmRankedFile[];
+  warnings: string[];
+}): number {
+  const seen = new Set<string>();
+  let applied = 0;
+
+  params.ranking.forEach((rankedFile, index) => {
+    let normalizedPath: string;
+    try {
+      normalizedPath = normalizeContextPath(rankedFile.path);
+      assertSafeContextPath(normalizedPath);
+    } catch (err) {
+      params.warnings.push(`ChatGPT ranked path ignored as unsafe: ${rankedFile.path} (${unknownErrorMessage(err)})`);
+      return;
+    }
+
+    const candidate = params.state.candidates.get(normalizedPath);
+    if (!candidate) {
+      params.warnings.push(`ChatGPT ranked path ignored because it was not a deterministic candidate: ${normalizedPath}`);
+      return;
+    }
+    if (seen.has(normalizedPath)) return;
+    seen.add(normalizedPath);
+
+    const fallbackScore = Math.max(0.1, 1 - index * 0.01);
+    const minimum = pinnedCandidateMinimum(candidate) ?? 0;
+    candidate.score = Math.max(clampedScore(rankedFile.score, fallbackScore), minimum);
+    const reason = rankedFile.reason
+      ? `ChatGPT rerank: ${truncateText(rankedFile.reason, 500)}`
+      : `ChatGPT rerank position ${index + 1}`;
+    if (!candidate.reasons.includes(reason)) {
+      candidate.reasons.push(reason);
+    }
+    applied++;
+  });
+
+  if (applied === 0) {
+    throw new Error('ChatGPT ranking did not contain any usable deterministic candidate paths.');
+  }
+
+  return applied;
+}
+
+function rankingPrompt(state: ScoutWorkingState): string {
+  const candidates = Array.from(state.candidates.values()).sort(outputSort).map(candidate => ({
+    path: candidate.path,
+    role: candidate.role,
+    relevance_score: candidate.score,
+    is_core: candidate.isCore,
+    source: candidate.source,
+    size_chars: state.repoFiles.get(candidate.path)?.sizeChars ?? 0,
+    reasons: candidate.reasons
+  }));
+
+  return [
+    'You are improving repository context discovery for a code review tool.',
+    'Rank only the provided deterministic candidate files for relevance to the query.',
+    'Do not invent paths. Do not request file contents. Preserve explicitly provided query paths, entrypoints, and changed files as highly relevant.',
+    'Return only JSON with this shape: {"ranked_files":[{"path":"relative/path.ts","relevance_score":0.0,"relevance_reason":"short reason"}]}.',
+    JSON.stringify({ query: state.query, candidates }, null, 2)
+  ].join('\n\n');
+}
+
+function briefingPrompt(state: ScoutWorkingState, finalized: ScoutFinalizedContext): string {
+  const recommended = selectedForOutput([...finalized.selection.selected], state.repoFiles);
+  let remainingExcerptChars = LLM_BRIEFING_MAX_TOTAL_EXCERPT_CHARS;
+  const selectedFiles = recommended.map(file => {
+    const repoFile = state.repoFiles.get(file.path)!;
+    const excerptChars = Math.min(
+      repoFile.content.length,
+      LLM_BRIEFING_MAX_FILE_EXCERPT_CHARS,
+      Math.max(0, remainingExcerptChars)
+    );
+    remainingExcerptChars -= excerptChars;
+    return {
+      path: file.path,
+      role: file.role,
+      relevance_reason: file.relevance_reason,
+      size_chars: file.size_chars,
+      content_excerpt: repoFile.content.slice(0, excerptChars),
+      excerpt_truncated: excerptChars < repoFile.content.length
+    };
+  });
+
+  const omittedFiles = Array.from(finalized.selection.omitted.values())
+    .sort((a, b) => a.path.localeCompare(b.path))
+    .slice(0, LLM_OMITTED_FILE_LIMIT);
+
+  return [
+    'You are drafting structured context notes for a council code review.',
+    'Use only the selected_files and omitted_files listed below. Do not invent paths or facts.',
+    'The selected files are authoritative repository evidence; excerpts are bounded and may be incomplete.',
+    'Return only JSON with a top-level structured_review object containing exactly these string fields:',
+    STRUCTURED_REVIEW_FIELDS.join(', '),
+    JSON.stringify({
+      query: state.query,
+      selected_files: selectedFiles,
+      omitted_files: omittedFiles
+    }, null, 2)
+  ].join('\n\n');
+}
+
+function parseLlmStructuredReview(response: string): NonNullable<CouncilContext['structured_review']> {
+  const parsed = parseJsonObjectFromLlmResponse(response);
+  const reviewCandidate = isRecord(parsed.structured_review) ? parsed.structured_review : parsed;
+  const allowed = new Set<string>(STRUCTURED_REVIEW_FIELDS);
+  const unknownFields = Object.keys(reviewCandidate).filter(field => !allowed.has(field));
+  if (unknownFields.length > 0) {
+    throw new Error(`ChatGPT structured_review contained unknown field(s): ${unknownFields.join(', ')}.`);
+  }
+
+  const review: Partial<NonNullable<CouncilContext['structured_review']>> = {};
+  for (const field of STRUCTURED_REVIEW_FIELDS) {
+    const value = reviewCandidate[field];
+    if (typeof value !== 'string' || value.trim() === '') {
+      throw new Error(`ChatGPT structured_review field ${field} must be a non-empty string.`);
+    }
+    if (value.length > MAX_CONTEXT_FILE_CHARS) {
+      throw new Error(`ChatGPT structured_review field ${field} exceeds ${MAX_CONTEXT_FILE_CHARS} characters.`);
+    }
+    review[field] = value;
+  }
+
+  return review as NonNullable<CouncilContext['structured_review']>;
+}
+
+function assertStructuredReviewPathConsistency(params: {
+  review: NonNullable<CouncilContext['structured_review']>;
+  selectedPaths: Set<string>;
+  omittedPaths: Set<string>;
+}): void {
+  for (const field of STRUCTURED_REVIEW_FIELDS) {
+    for (const referencedPath of referencedRepositoryPaths(params.review[field])) {
+      const normalizedPath = normalizeContextPath(referencedPath);
+      assertSafeContextPath(normalizedPath);
+      if (field === 'omitted_material') {
+        if (!params.omittedPaths.has(normalizedPath)) {
+          throw new Error(`ChatGPT omitted_material referenced a file that is not omitted: ${normalizedPath}`);
+        }
+      } else if (!params.selectedPaths.has(normalizedPath)) {
+        throw new Error(`ChatGPT structured_review field ${field} referenced a file that is not selected: ${normalizedPath}`);
+      }
+    }
+  }
+}
+
+function buildLlmStats(params: {
+  startedAt: number;
+  now: () => number;
+  runId: string;
+  taskIds: string[];
+  rankingApplied: boolean;
+  briefingApplied: boolean;
+  fallbackReason?: string;
+}): ScoutLlmStats {
+  return {
+    provider: 'chatgpt',
+    attempted: true,
+    ranking_applied: params.rankingApplied,
+    briefing_applied: params.briefingApplied,
+    run_id: params.runId,
+    task_ids: params.taskIds,
+    duration_ms: Math.max(0, params.now() - params.startedAt),
+    ...(params.fallbackReason ? { fallback_reason: truncateText(params.fallbackReason, 500) } : {})
+  };
+}
+
+const LLM_RANKING_NOTES = 'Generated by scout_discover_context with ChatGPT candidate reranking and deterministic structured_review. Repository files were assembled locally and validated before return.';
+const LLM_FULL_BRIEFING_NOTES = 'Generated by scout_discover_context with ChatGPT candidate reranking and ChatGPT-generated structured_review from bounded repository excerpts. Repository files were assembled locally and validated before return.';
+
+export function discoverScoutContext(args: ScoutDiscoverContextArgs): ScoutDiscoverContextResult {
+  const state = collectScoutContextState(args);
+  const finalized = finalizeScoutContext(state);
+  return buildScoutResult({
+    state,
+    finalized,
+    strategy: 'deterministic-v1'
+  });
+}
+
+export async function discoverScoutContextWithLlm(
+  args: ScoutDiscoverContextArgs,
+  deps: ScoutLlmDeps = {}
+): Promise<ScoutDiscoverContextResult> {
+  const baseState = collectScoutContextState(args);
+  const baseFinalized = finalizeScoutContext(baseState);
+
+  if (args.enhance_with_llm !== true) {
+    return buildScoutResult({
+      state: baseState,
+      finalized: baseFinalized,
+      strategy: 'deterministic-v1'
+    });
+  }
+
+  const now = deps.now ?? Date.now;
+  const startedAt = now();
+  const timeoutMs = llmTimeoutMs(args);
+  const runId = `scout_llm_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
+  const rankingTaskId = `${runId}_ranking`;
+  const briefingTaskId = `${runId}_briefing`;
+  const taskIds = [rankingTaskId];
+  const runLlm = deps.runLlm ?? defaultScoutLlmRunner;
+  const timeout = timeoutController(timeoutMs);
+  const llmWarnings: string[] = [];
+
+  try {
+    const llmState = cloneWorkingState(baseState);
+    const rankingResponse = await runLlm({
+      phase: 'ranking',
+      prompt: rankingPrompt(llmState),
+      runId,
+      taskId: rankingTaskId,
+      signal: timeout.controller.signal,
+      timeoutMs
+    });
+    const ranking = parseLlmRanking(rankingResponse);
+    applyLlmRanking({ state: llmState, ranking, warnings: llmWarnings });
+
+    const rankedFinalized = finalizeScoutContext(llmState, { notes: LLM_RANKING_NOTES });
+
+    taskIds.push(briefingTaskId);
+    let briefingResponse: string;
+    try {
+      briefingResponse = await runLlm({
+        phase: 'briefing',
+        prompt: briefingPrompt(llmState, rankedFinalized),
+        runId,
+        taskId: briefingTaskId,
+        signal: timeout.controller.signal,
+        timeoutMs
+      });
+    } catch (err) {
+      throw err;
+    }
+
+    try {
+      const structuredReview = parseLlmStructuredReview(briefingResponse);
+      assertStructuredReviewPathConsistency({
+        review: structuredReview,
+        selectedPaths: new Set(rankedFinalized.selection.selected.map(candidate => candidate.path)),
+        omittedPaths: new Set(Array.from(rankedFinalized.selection.omitted.keys()))
+      });
+
+      const fullContext = applyContextOverrides(rankedFinalized.context, {
+        notes: LLM_FULL_BRIEFING_NOTES,
+        structuredReview
+      });
+      const fullValidated = validateCouncilContext(fullContext, llmState.query);
+      return buildScoutResult({
+        state: llmState,
+        finalized: {
+          selection: rankedFinalized.selection,
+          context: fullContext,
+          validated: fullValidated
+        },
+        strategy: 'chatgpt-full-briefing-v1',
+        llm: buildLlmStats({
+          startedAt,
+          now,
+          runId,
+          taskIds,
+          rankingApplied: true,
+          briefingApplied: true
+        }),
+        warnings: llmWarnings
+      });
+    } catch (err) {
+      const reason = `ChatGPT briefing rejected: ${unknownErrorMessage(err)}`;
+      return buildScoutResult({
+        state: llmState,
+        finalized: rankedFinalized,
+        strategy: 'chatgpt-partial-v1',
+        llm: buildLlmStats({
+          startedAt,
+          now,
+          runId,
+          taskIds,
+          rankingApplied: true,
+          briefingApplied: false,
+          fallbackReason: reason
+        }),
+        warnings: [...llmWarnings, reason]
+      });
+    }
+  } catch (err) {
+    const reason = `ChatGPT Scout enhancement fell back to deterministic context: ${unknownErrorMessage(err)}`;
+    return buildScoutResult({
+      state: baseState,
+      finalized: baseFinalized,
+      strategy: 'chatgpt-fallback-v1',
+      llm: buildLlmStats({
+        startedAt,
+        now,
+        runId,
+        taskIds,
+        rankingApplied: false,
+        briefingApplied: false,
+        fallbackReason: reason
+      }),
+      warnings: [reason]
+    });
+  } finally {
+    timeout.clear();
+  }
 }

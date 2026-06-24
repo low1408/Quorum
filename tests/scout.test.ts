@@ -5,9 +5,13 @@ import test from 'node:test';
 import { config } from '../from_orchestrator/config/index.ts';
 import { DBService, initSchema } from '../from_orchestrator/db/database.ts';
 import { handleScoutDiscoverContext } from '../from_orchestrator/mcp/server.ts';
-import { discoverScoutContext } from '../from_orchestrator/tools/scout.ts';
+import {
+  discoverScoutContext,
+  discoverScoutContextWithLlm,
+  type ScoutLlmRunner
+} from '../from_orchestrator/tools/scout.ts';
 
-function paths(result: ReturnType<typeof discoverScoutContext>): string[] {
+function paths(result: { recommended_files: Array<{ path: string }> }): string[] {
   return result.recommended_files.map(file => file.path);
 }
 
@@ -20,6 +24,40 @@ function scoutMetricIdsBefore(): Set<string> {
 function newScoutMetrics(before: Set<string>): any[] {
   return DBService.getMcpToolCallMetrics({ toolName: 'scout_discover_context' })
     .filter(row => !before.has(row.tool_call_id));
+}
+
+function jsonResponse(value: unknown): string {
+  return `\`\`\`json\n${JSON.stringify(value)}\n\`\`\``;
+}
+
+function validLlmReview(pathValue = 'from_orchestrator/security/encryption.ts') {
+  return {
+    structured_review: {
+      review_objective: `Review ChatGPT-selected context for ${pathValue}.`,
+      architecture: `${pathValue} contains the encryption helper implementation selected for review.`,
+      execution_flow: `Callers rely on ${pathValue} to encrypt and decrypt serialized values.`,
+      assumptions_and_invariants: 'Selected repository files remain authoritative; this briefing was drafted from bounded excerpts.',
+      core_evidence: `${pathValue} is the primary implementation evidence.`,
+      supporting_contracts: 'No additional selected supporting contracts are required for this focused briefing.',
+      privacy_and_persistence: 'The selected evidence concerns encryption behavior and does not include real secret files.',
+      tests_and_runtime_evidence: 'No runtime evidence or nearby tests were selected for this focused query.',
+      omitted_material: 'No omitted file paths are required for this briefing.'
+    }
+  };
+}
+
+function fakeLlmRunner(params: {
+  ranking: string | Error;
+  briefing?: string | Error;
+  calls?: string[];
+}): ScoutLlmRunner {
+  return async ({ phase }) => {
+    params.calls?.push(phase);
+    const response = phase === 'ranking' ? params.ranking : params.briefing;
+    if (response instanceof Error) throw response;
+    if (typeof response === 'string') return response;
+    throw new Error(`No fake response configured for ${phase}`);
+  };
 }
 
 test('scout_discover_context includes local imports and TypeScript config files', () => {
@@ -75,6 +113,7 @@ test('scout_discover_context adds nearby tests for implementation queries', () =
   const result = discoverScoutContext({
     query: 'implement an MCP context validation fix in from_orchestrator/mcp/contextValidation.ts',
     entrypoints: ['from_orchestrator/mcp/contextValidation.ts'],
+    token_budget_chars: 450000,
     include_reverse_importers: false
   });
 
@@ -83,6 +122,169 @@ test('scout_discover_context adds nearby tests for implementation queries', () =
   assert.ok(selected.includes('tests/contextValidation.test.ts'));
   assert.ok(selected.includes('package.json'));
   assert.ok(selected.includes('tsconfig.json'));
+});
+
+test('scout_discover_context async wrapper remains deterministic unless LLM is requested', async () => {
+  const calls: string[] = [];
+  const result = await discoverScoutContextWithLlm({
+    query: 'Review from_orchestrator/security/encryption.ts',
+    entrypoints: ['from_orchestrator/security/encryption.ts'],
+    include_reverse_importers: false,
+    include_tests: false
+  }, {
+    runLlm: fakeLlmRunner({
+      ranking: new Error('runner should not be called'),
+      calls
+    })
+  });
+
+  assert.equal(result.stats.strategy, 'deterministic-v1');
+  assert.equal(result.stats.llm, undefined);
+  assert.deepEqual(calls, []);
+  assert.ok(paths(result).includes('from_orchestrator/security/encryption.ts'));
+});
+
+test('scout_discover_context applies valid ChatGPT ranking and structured review', async () => {
+  const deterministic = discoverScoutContext({
+    query: 'Review from_orchestrator/security/encryption.ts',
+    entrypoints: ['from_orchestrator/security/encryption.ts'],
+    include_reverse_importers: false,
+    include_tests: false
+  });
+
+  const result = await discoverScoutContextWithLlm({
+    query: 'Review from_orchestrator/security/encryption.ts',
+    entrypoints: ['from_orchestrator/security/encryption.ts'],
+    include_reverse_importers: false,
+    include_tests: false,
+    enhance_with_llm: true
+  }, {
+    now: () => 1000,
+    runLlm: fakeLlmRunner({
+      ranking: jsonResponse({
+        ranked_files: [{
+          path: 'from_orchestrator/security/encryption.ts',
+          relevance_score: 0.99,
+          relevance_reason: 'Primary encryption implementation for the review.'
+        }]
+      }),
+      briefing: jsonResponse(validLlmReview())
+    })
+  });
+
+  const encryption = result.recommended_files.find(file => file.path === 'from_orchestrator/security/encryption.ts');
+  assert.equal(result.stats.strategy, 'chatgpt-full-briefing-v1');
+  assert.equal(result.stats.llm?.ranking_applied, true);
+  assert.equal(result.stats.llm?.briefing_applied, true);
+  assert.match(encryption?.relevance_reason || '', /ChatGPT rerank: Primary encryption implementation/);
+  assert.match(result.context.notes || '', /ChatGPT-generated structured_review/);
+  assert.match(result.context.structured_review?.architecture || '', /encryption helper implementation/);
+  assert.notEqual(result.context_digest, deterministic.context_digest);
+});
+
+test('scout_discover_context ignores invalid ChatGPT ranked paths', async () => {
+  const result = await discoverScoutContextWithLlm({
+    query: 'Review from_orchestrator/security/encryption.ts',
+    entrypoints: ['from_orchestrator/security/encryption.ts'],
+    include_reverse_importers: false,
+    include_tests: false,
+    enhance_with_llm: true
+  }, {
+    runLlm: fakeLlmRunner({
+      ranking: jsonResponse({
+        ranked_files: [
+          {
+            path: 'not_real.ts',
+            relevance_score: 1,
+            relevance_reason: 'Invented path that must be ignored.'
+          },
+          {
+            path: 'from_orchestrator/security/encryption.ts',
+            relevance_score: 0.98,
+            relevance_reason: 'Valid deterministic candidate.'
+          }
+        ]
+      }),
+      briefing: jsonResponse(validLlmReview())
+    })
+  });
+
+  assert.equal(result.stats.strategy, 'chatgpt-full-briefing-v1');
+  assert.match(result.warnings.join('\n'), /not a deterministic candidate: not_real\.ts/);
+  assert.ok(paths(result).includes('from_orchestrator/security/encryption.ts'));
+});
+
+test('scout_discover_context falls back when ChatGPT ranking is malformed', async () => {
+  const result = await discoverScoutContextWithLlm({
+    query: 'Review from_orchestrator/security/encryption.ts',
+    entrypoints: ['from_orchestrator/security/encryption.ts'],
+    include_reverse_importers: false,
+    include_tests: false,
+    enhance_with_llm: true
+  }, {
+    runLlm: fakeLlmRunner({
+      ranking: 'not json'
+    })
+  });
+
+  assert.equal(result.stats.strategy, 'chatgpt-fallback-v1');
+  assert.equal(result.stats.llm?.ranking_applied, false);
+  assert.equal(result.stats.llm?.briefing_applied, false);
+  assert.match(result.stats.llm?.fallback_reason || '', /valid JSON object/);
+  assert.doesNotMatch(result.recommended_files[0].relevance_reason, /ChatGPT rerank/);
+});
+
+test('scout_discover_context keeps ranking when ChatGPT briefing is invalid', async () => {
+  const result = await discoverScoutContextWithLlm({
+    query: 'Review from_orchestrator/security/encryption.ts',
+    entrypoints: ['from_orchestrator/security/encryption.ts'],
+    include_reverse_importers: false,
+    include_tests: false,
+    enhance_with_llm: true
+  }, {
+    runLlm: fakeLlmRunner({
+      ranking: jsonResponse({
+        ranked_files: [{
+          path: 'from_orchestrator/security/encryption.ts',
+          relevance_score: 0.99,
+          relevance_reason: 'Ranking should survive invalid briefing.'
+        }]
+      }),
+      briefing: jsonResponse({
+        structured_review: {
+          review_objective: 'Missing the other required fields.'
+        }
+      })
+    })
+  });
+
+  const encryption = result.recommended_files.find(file => file.path === 'from_orchestrator/security/encryption.ts');
+  assert.equal(result.stats.strategy, 'chatgpt-partial-v1');
+  assert.equal(result.stats.llm?.ranking_applied, true);
+  assert.equal(result.stats.llm?.briefing_applied, false);
+  assert.match(encryption?.relevance_reason || '', /Ranking should survive invalid briefing/);
+  assert.match(result.context.structured_review?.architecture || '', /Scout selected files deterministically/);
+  assert.match(result.warnings.join('\n'), /ChatGPT briefing rejected/);
+});
+
+test('scout_discover_context falls back when ChatGPT runner fails', async () => {
+  const result = await discoverScoutContextWithLlm({
+    query: 'Review from_orchestrator/security/encryption.ts',
+    entrypoints: ['from_orchestrator/security/encryption.ts'],
+    include_reverse_importers: false,
+    include_tests: false,
+    enhance_with_llm: true
+  }, {
+    runLlm: fakeLlmRunner({
+      ranking: new Error('Authentication expired')
+    })
+  });
+
+  assert.equal(result.stats.strategy, 'chatgpt-fallback-v1');
+  assert.equal(result.stats.llm?.ranking_applied, false);
+  assert.equal(result.stats.llm?.briefing_applied, false);
+  assert.match(result.warnings.join('\n'), /Authentication expired/);
+  assert.ok(paths(result).includes('from_orchestrator/security/encryption.ts'));
 });
 
 test('scout_discover_context MCP handler returns structured context and records metrics', async () => {

@@ -101,6 +101,12 @@ npm run review-context:test
 
 Expected behavior: council requests are validated, executed through configured providers, persisted to the local database, and saved as Markdown report artifacts.
 
+Manual Scout LLM verification:
+
+1. Start the MCP server with `npm run mcp:start`.
+2. Call `scout_discover_context` with `enhance_with_llm: true` and, optionally, `llm_timeout_ms`.
+3. Confirm the response reports a `chatgpt-*` Scout strategy, includes LLM stats, and still returns validated repository context. Live ChatGPT/browser coverage is intentionally not part of `npm test`.
+
 ---
 
 ## Project Structure
@@ -114,4 +120,3 @@ Expected behavior: council requests are validated, executed through configured p
 - `review-context/` - generated review bundles; ignored by default because contents are reproducible and may include large evidence payloads.
 - `quorum/` - raw generated council reports; ignored by default and copied into `Extra/` only after review/sanitization.
 - `sessions/` - encrypted local provider session state; ignored and not suitable for submission.
-
