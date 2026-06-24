@@ -5,6 +5,7 @@ export type FailureCode =
   | 'CAPTCHA'
   | 'RATE_LIMITED'
   | 'SELECTOR_MISSING'
+  | 'BROWSER_LAUNCH'
   | 'TIMEOUT'
   | 'ABORTED'
   | 'PERSISTENCE_ERROR'
@@ -78,6 +79,7 @@ export function publicMessageForCode(code: FailureCode): string {
     case 'CAPTCHA': return 'The provider requires manual CAPTCHA intervention.';
     case 'RATE_LIMITED': return 'The provider is temporarily rate limited.';
     case 'SELECTOR_MISSING': return 'The provider interface could not be located.';
+    case 'BROWSER_LAUNCH': return 'The browser could not be launched in the current runtime.';
     case 'TIMEOUT': return 'The provider operation timed out.';
     case 'ABORTED': return 'The provider operation was cancelled.';
     case 'PERSISTENCE_ERROR': return 'The result could not be persisted.';
@@ -98,6 +100,7 @@ function classifyFailureCode(error: unknown): FailureCode {
   if (/AUTH_EXPIRED|auth|login/i.test(`${failureClass} ${message}`)) return 'AUTH_REQUIRED';
   if (/CAPTCHA/i.test(`${failureClass} ${message}`)) return 'CAPTCHA';
   if (/RATE_LIMITED|rate limit|too many requests/i.test(`${failureClass} ${message}`)) return 'RATE_LIMITED';
+  if (/headed browser without having an? XServer|Missing X server|platform failed to initialize|browserType\.launch/i.test(message)) return 'BROWSER_LAUNCH';
   if (/selector|locator|Failed to locate|not visible|input readiness/i.test(message)) return 'SELECTOR_MISSING';
   if (/empty markdown|empty_extraction|no extractable/i.test(`${failureClass} ${message}`)) return 'EXTRACTION_EMPTY';
   if (/Unsupported provider/i.test(message)) return 'UNSUPPORTED_PROVIDER';

@@ -1,11 +1,14 @@
 import fs from 'fs';
 import path from 'path';
 
-// Define a stable log path in the workspace
-const logPath = '/home/harry/Documents/Github-Projects/quorum-llm-council/quorum-mcp.log';
+const workspaceRoot = process.env.COUNCIL_WORKSPACE_ROOT
+  ? path.resolve(process.env.COUNCIL_WORKSPACE_ROOT)
+  : process.cwd();
+const logPath = path.resolve(workspaceRoot, 'quorum-mcp.log');
 
 function writeLog(level: string, ...args: any[]) {
   try {
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
     const timestamp = new Date().toISOString();
     const message = args
       .map(arg => {

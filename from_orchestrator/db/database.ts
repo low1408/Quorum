@@ -572,6 +572,31 @@ export function initSchema() {
       }
     }
 
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS McpToolCallMetrics (
+        tool_call_id TEXT PRIMARY KEY,
+        tool_name TEXT NOT NULL,
+        run_id TEXT REFERENCES Runs(run_id) ON DELETE SET NULL,
+        status TEXT NOT NULL CHECK(status IN (
+          'RECEIVED',
+          'VALIDATION_FAILED',
+          'COMPLETED',
+          'PARTIAL_SUCCESS',
+          'FAILED',
+          'CANCELLED',
+          'INTERVENTION_REQUIRED'
+        )),
+        requested_provider_count INTEGER DEFAULT 0,
+        successful_provider_count INTEGER DEFAULT 0,
+        failed_provider_count INTEGER DEFAULT 0,
+        duration_ms INTEGER,
+        context_digest TEXT,
+        error_message TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        completed_at TIMESTAMP
+      )
+    `).run();
+
     // 3. Lineage Table
     db.prepare(`
       CREATE TABLE IF NOT EXISTS Lineage (
@@ -819,6 +844,8 @@ export function initSchema() {
     db.prepare(`CREATE INDEX IF NOT EXISTS idx_task_attempts_invocation_id ON TaskAttempts(invocation_id)`).run();
     db.prepare(`CREATE INDEX IF NOT EXISTS idx_artifacts_run_id ON Artifacts(run_id)`).run();
     db.prepare(`CREATE INDEX IF NOT EXISTS idx_summary_eval_run_id ON SummaryEvaluationMetrics(run_id)`).run();
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_mcp_tool_metrics_tool_status ON McpToolCallMetrics(tool_name, status)`).run();
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_mcp_tool_metrics_run_id ON McpToolCallMetrics(run_id)`).run();
   })();
 
   repairLegacyTasksRunForeignKey(db);
@@ -1098,6 +1125,138 @@ export class DBService {
         AND status NOT IN ('COMPLETED', 'PARTIAL_SUCCESS', 'FAILED', 'CANCELLED', 'INTERVENTION_REQUIRED')
     `);
     return stmt.run(status, runId).changes === 1;
+  }
+
+  public static createMcpToolCallMetric(params: {
+    toolCallId: string;
+    toolName: string;
+    requestedProviderCount?: number;
+    contextDigest?: string | null;
+  }): void {
+    getDB().prepare(`
+      INSERT INTO McpToolCallMetrics (
+        tool_call_id,
+        tool_name,
+        status,
+        requested_provider_count,
+        context_digest
+      ) VALUES (
+        @toolCallId,
+        @toolName,
+        'RECEIVED',
+        @requestedProviderCount,
+        @contextDigest
+      )
+    `).run({
+      toolCallId: params.toolCallId,
+      toolName: params.toolName,
+      requestedProviderCount: params.requestedProviderCount ?? 0,
+      contextDigest: params.contextDigest ?? null
+    });
+  }
+
+  public static completeMcpToolCallMetric(params: {
+    toolCallId: string;
+    runId?: string | null;
+    status: 'COMPLETED' | 'PARTIAL_SUCCESS';
+    requestedProviderCount?: number;
+    successfulProviderCount?: number;
+    failedProviderCount?: number;
+    durationMs?: number | null;
+    contextDigest?: string | null;
+  }): void {
+    getDB().prepare(`
+      UPDATE McpToolCallMetrics
+      SET run_id = @runId,
+          status = @status,
+          requested_provider_count = @requestedProviderCount,
+          successful_provider_count = @successfulProviderCount,
+          failed_provider_count = @failedProviderCount,
+          duration_ms = @durationMs,
+          context_digest = @contextDigest,
+          error_message = NULL,
+          completed_at = CURRENT_TIMESTAMP
+      WHERE tool_call_id = @toolCallId
+    `).run({
+      toolCallId: params.toolCallId,
+      runId: params.runId ?? null,
+      status: params.status,
+      requestedProviderCount: params.requestedProviderCount ?? 0,
+      successfulProviderCount: params.successfulProviderCount ?? 0,
+      failedProviderCount: params.failedProviderCount ?? 0,
+      durationMs: params.durationMs ?? null,
+      contextDigest: params.contextDigest ?? null
+    });
+  }
+
+  public static failMcpToolCallMetric(params: {
+    toolCallId: string;
+    runId?: string | null;
+    status?: 'VALIDATION_FAILED' | 'FAILED' | 'CANCELLED' | 'INTERVENTION_REQUIRED';
+    requestedProviderCount?: number;
+    successfulProviderCount?: number;
+    failedProviderCount?: number;
+    durationMs?: number | null;
+    contextDigest?: string | null;
+    errorMessage?: string | null;
+  }): void {
+    getDB().prepare(`
+      UPDATE McpToolCallMetrics
+      SET run_id = @runId,
+          status = @status,
+          requested_provider_count = @requestedProviderCount,
+          successful_provider_count = @successfulProviderCount,
+          failed_provider_count = @failedProviderCount,
+          duration_ms = @durationMs,
+          context_digest = @contextDigest,
+          error_message = @errorMessage,
+          completed_at = CURRENT_TIMESTAMP
+      WHERE tool_call_id = @toolCallId
+    `).run({
+      toolCallId: params.toolCallId,
+      runId: params.runId ?? null,
+      status: params.status ?? 'FAILED',
+      requestedProviderCount: params.requestedProviderCount ?? 0,
+      successfulProviderCount: params.successfulProviderCount ?? 0,
+      failedProviderCount: params.failedProviderCount ?? 0,
+      durationMs: params.durationMs ?? null,
+      contextDigest: params.contextDigest ?? null,
+      errorMessage: params.errorMessage ?? null
+    });
+  }
+
+  public static getMcpToolCallMetrics(params: {
+    toolCallId?: string;
+    toolName?: string;
+    runId?: string;
+    status?: string;
+  } = {}): any[] {
+    const clauses: string[] = [];
+    const values: any = {};
+    if (params.toolCallId) {
+      clauses.push('tool_call_id = @toolCallId');
+      values.toolCallId = params.toolCallId;
+    }
+    if (params.toolName) {
+      clauses.push('tool_name = @toolName');
+      values.toolName = params.toolName;
+    }
+    if (params.runId) {
+      clauses.push('run_id = @runId');
+      values.runId = params.runId;
+    }
+    if (params.status) {
+      clauses.push('status = @status');
+      values.status = params.status;
+    }
+
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+    return getDB().prepare(`
+      SELECT *
+      FROM McpToolCallMetrics
+      ${where}
+      ORDER BY created_at ASC, tool_call_id ASC
+    `).all(values);
   }
 
   /**

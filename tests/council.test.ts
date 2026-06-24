@@ -322,3 +322,32 @@ test('runCouncilConsultation does not retry failures after confirmed submission'
   assert.equal(providerAttempts, 1);
   assert.equal(attempts.count, 1);
 });
+
+test('runCouncilConsultation includes concise provider failure details when all members fail', async () => {
+  initSchema();
+  const context = validateCouncilContext({
+    files: [{ path: 'virtual.ts', content: 'export const value = 1;' }]
+  }, 'Review this file.');
+
+  const runnerFactory: CouncilRunnerFactory = () => ({
+    async executeTask() {
+      throw new Error([
+        'browserType.launch: Target page, context or browser has been closed',
+        'Looks like you launched a headed browser without having a XServer running.',
+        'Missing X server or $DISPLAY'
+      ].join('\n'));
+    },
+    async close() {}
+  });
+
+  await assert.rejects(
+    runCouncilConsultation({
+      question: 'Review this file.',
+      context,
+      providers: ['mock'],
+      maxRetries: 0,
+      runnerFactory
+    }),
+    /Failures: mock: BROWSER_LAUNCH/
+  );
+});

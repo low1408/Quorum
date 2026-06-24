@@ -1,23 +1,40 @@
 import dotenv from 'dotenv';
 import path from 'path';
-import { fileURLToPath } from 'url';
 
-// Keep test runs hermetic; package scripts set the required test env explicitly.
-if (process.env.NODE_ENV !== 'test') {
-  dotenv.config();
-}
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 const rootDir = process.env.COUNCIL_WORKSPACE_ROOT
   ? path.resolve(process.env.COUNCIL_WORKSPACE_ROOT)
   : process.cwd();
 
+// Keep test runs hermetic; package scripts set the required test env explicitly.
+if (process.env.NODE_ENV !== 'test') {
+  dotenv.config({ path: path.resolve(rootDir, '.env') });
+}
+
+export function normalizeCdpEndpoint(value: string | undefined): string {
+  const endpoint = value?.trim() || '';
+  if (!endpoint) return '';
+  if (/^\d+$/.test(endpoint)) return `http://127.0.0.1:${endpoint}`;
+  if (/^[\w.-]+:\d+$/.test(endpoint)) return `http://${endpoint}`;
+  return endpoint;
+}
+
+export function shouldLaunchHeadless(
+  value: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform
+): boolean {
+  if (value === 'true') return true;
+  if (value === 'false') {
+    return platform === 'linux' && !env.DISPLAY && !env.WAYLAND_DISPLAY;
+  }
+  return platform === 'linux' && !env.DISPLAY && !env.WAYLAND_DISPLAY;
+}
+
 export const config = {
   encryptionKey: process.env.ENCRYPTION_KEY || 'default_fallback_secret_key_32_chars_long',
   databasePath: process.env.DATABASE_PATH ? path.resolve(rootDir, process.env.DATABASE_PATH) : path.resolve(rootDir, './orchestrator.db'),
-  headless: process.env.HEADLESS === 'true',
-  cdpEndpoint: process.env.CDP_ENDPOINT || '',
+  headless: shouldLaunchHeadless(process.env.HEADLESS),
+  cdpEndpoint: normalizeCdpEndpoint(process.env.CDP_ENDPOINT),
   evaluatorProvider: process.env.EVALUATOR_PROVIDER || 'gemini',
   enableSummaryEvaluation: false,
   enableCouncilEvaluation: process.env.ENABLE_COUNCIL_EVALUATION !== 'false',

@@ -202,6 +202,13 @@ export async function delay(ms: number): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function conciseFailureDetail(provider: string, reason: unknown): string {
+  const failure = classifyFailure(reason);
+  const rawMessage = reason instanceof Error ? reason.message : String(reason);
+  const firstLine = rawMessage.split('\n').map(line => line.trim()).find(Boolean);
+  return `${provider}: ${failure.code}${firstLine ? ` (${firstLine.slice(0, 180)})` : ''}`;
+}
+
 export async function mapWithConcurrency<T, R>(items: T[], limit: number, mapper: (item: T, index: number) => Promise<R>): Promise<PromiseSettledResult<R>[]> {
   const results: PromiseSettledResult<R>[] = new Array(items.length);
   let nextIndex = 0;
@@ -335,10 +342,13 @@ async function runCouncilConsultationInner(request: CouncilConsultationRequest, 
     });
 
     const analyses: CouncilAnalysis[] = [];
+    const failedProviders: string[] = [];
     for (const result of analysisResults) {
       if (result.status === 'fulfilled') {
         analyses.push(result.value);
       } else {
+        const provider = providers[failedProviders.length + analyses.length] ?? 'unknown';
+        failedProviders.push(conciseFailureDetail(provider, result.reason));
         const reason = result.reason?.message || String(result.reason);
         warnings.push(`A council member failed, timed out, or was cancelled and was omitted from consolidation: ${reason}`);
       }
@@ -346,7 +356,8 @@ async function runCouncilConsultationInner(request: CouncilConsultationRequest, 
 
     if (analyses.length === 0) {
       DBService.updateRunStatusIfNotTerminal(runId, 'FAILED');
-      throw new Error(`All council members failed for run ${runId}.`);
+      const suffix = failedProviders.length > 0 ? ` Failures: ${failedProviders.join('; ')}.` : '';
+      throw new Error(`All council members failed for run ${runId}.${suffix}`);
     }
 
     const report = buildDirectReport(analyses);
