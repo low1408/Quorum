@@ -8,10 +8,11 @@ import { DBService, initSchema } from '../db/database.ts';
 import { runCouncilConsultation, uniqueProviders } from '../engine/council.ts';
 import { runMcqConsultation } from '../engine/mcq.ts';
 import { runMaterializeValidationTests, selectValidationTestProvider } from '../engine/validationTests.ts';
-import { discoverScoutContextWithLlm } from '../tools/scout.ts';
-import { validateCouncilContext } from './contextValidation.ts';
+import { discoverScoutContextWithLlm, type ScoutDiscoverContextResult } from '../tools/scout.ts';
+import { validateCouncilContext, type CouncilContext } from './contextValidation.ts';
 import { saveCouncilReportArtifact } from './reportArtifact.ts';
 import { saveMcqReportArtifact } from './mcqReportArtifact.ts';
+import { loadScoutContextArtifact, saveScoutContextArtifact, type ScoutContextArtifact } from './scoutContextArtifact.ts';
 
 const contextFileSchema = z.object({
   path: z.string(),
@@ -61,7 +62,9 @@ const councilContextSchema = z.object({
 
 const consultCouncilSchema = {
   question: z.string().min(1),
-  context: councilContextSchema,
+  context: councilContextSchema.optional(),
+  scout_context_ref: z.string().min(1).optional(),
+  workspace_root: z.string().optional(),
   constraints: z.string().optional(),
   providers: z.array(z.string().min(1)).optional(),
   max_wait_ms: z.number().int().positive().optional(),
@@ -80,7 +83,9 @@ const scoutDiscoverContextSchema = {
   include_tests: z.boolean().optional(),
   include_reverse_importers: z.boolean().optional(),
   enhance_with_llm: z.boolean().optional(),
-  llm_timeout_ms: z.number().int().positive().optional()
+  llm_timeout_ms: z.number().int().positive().optional(),
+  response_mode: z.enum(['full', 'compact', 'headroom']).optional(),
+  compress_output: z.boolean().optional()
 };
 
 export const server = new McpServer({
@@ -92,6 +97,19 @@ type ToolResponse = {
   content: Array<{ type: 'text'; text: string }>;
   structuredContent: any;
 };
+
+type ScoutResponseMode = 'full' | 'compact' | 'headroom';
+
+type ScoutHeadroomCompression = {
+  compressed?: string;
+  hash?: string;
+  original_tokens?: number;
+  compressed_tokens?: number;
+  savings_percent?: number;
+  transforms?: string[];
+};
+
+type ScoutHeadroomCompressor = (content: string) => Promise<ScoutHeadroomCompression>;
 
 function createToolCallId(toolName: string): string {
   return `${toolName}_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
@@ -105,10 +123,244 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+function truncateText(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  return `${value.slice(0, Math.max(0, maxChars - 15))}...[truncated]`;
+}
+
 function failedMetricStatus(err: any): 'FAILED' | 'CANCELLED' | 'INTERVENTION_REQUIRED' {
   if (err?.code === 'CANCELLED' || err?.name === 'AbortError') return 'CANCELLED';
   if (err?.code === 'INTERVENTION_REQUIRED') return 'INTERVENTION_REQUIRED';
   return 'FAILED';
+}
+
+async function resolveCouncilContext(args: any): Promise<{ context: CouncilContext; workspaceRoot?: string }> {
+  if (args.context && args.scout_context_ref) {
+    throw new Error('Provide either context or scout_context_ref, not both.');
+  }
+  if (args.context) return { context: args.context, workspaceRoot: args.workspace_root };
+  if (args.scout_context_ref) {
+    const scoutResult = await loadScoutContextArtifact(args.scout_context_ref);
+    return { context: scoutResult.context, workspaceRoot: scoutResult.workspace_root };
+  }
+  throw new Error('consult_council requires either context or scout_context_ref.');
+}
+
+function scoutResponseMode(args: any): ScoutResponseMode {
+  const raw = args.response_mode ?? process.env.SCOUT_OUTPUT_MODE;
+  if ((raw === undefined || raw === null || raw === '') && args.compress_output === true) {
+    return 'headroom';
+  }
+  if (raw === undefined || raw === null || raw === '') return 'full';
+  if (raw === 'full' || raw === 'compact' || raw === 'headroom') return raw;
+  throw new Error(`Invalid Scout response_mode: ${String(raw)}`);
+}
+
+function scoutHeadroomMcpUrl(): string {
+  const explicitUrl = process.env.HEADROOM_MCP_URL?.trim();
+  if (explicitUrl) return explicitUrl;
+  const proxyUrl = process.env.HEADROOM_PROXY_URL?.trim();
+  if (proxyUrl) return new URL('/mcp', proxyUrl.endsWith('/') ? proxyUrl : `${proxyUrl}/`).toString();
+  return 'http://127.0.0.1:8787/mcp';
+}
+
+function scoutHeadroomMaxInlineChars(): number {
+  const raw = Number.parseInt(process.env.SCOUT_HEADROOM_MAX_INLINE_CHARS || '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 24_000;
+}
+
+function parseJsonOrText(text: string): any {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+function parseJsonRpcPayload(text: string): any {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('event:') && !trimmed.startsWith('data:')) {
+    return JSON.parse(trimmed);
+  }
+
+  for (const line of trimmed.split(/\r?\n/u)) {
+    if (!line.startsWith('data:')) continue;
+    const data = line.slice('data:'.length).trim();
+    if (!data || data === '[DONE]') continue;
+    const parsed = JSON.parse(data);
+    if (parsed?.result || parsed?.error) return parsed;
+  }
+
+  throw new Error('Headroom MCP returned an SSE response without a JSON-RPC payload.');
+}
+
+function normalizeHeadroomCompression(value: any): ScoutHeadroomCompression {
+  if (!value || typeof value !== 'object') return {};
+  const structured = value.structuredContent && typeof value.structuredContent === 'object'
+    ? value.structuredContent
+    : value;
+  const textContent = Array.isArray(value.content)
+    ? value.content.find((item: any) => item?.type === 'text' && typeof item.text === 'string')?.text
+    : undefined;
+  const parsedText = typeof textContent === 'string' ? parseJsonOrText(textContent) : undefined;
+  const source = parsedText && typeof parsedText === 'object' ? parsedText : structured;
+
+  return {
+    compressed: typeof source.compressed === 'string' ? source.compressed : undefined,
+    hash: typeof source.hash === 'string' ? source.hash : undefined,
+    original_tokens: typeof source.original_tokens === 'number' ? source.original_tokens : undefined,
+    compressed_tokens: typeof source.compressed_tokens === 'number' ? source.compressed_tokens : undefined,
+    savings_percent: typeof source.savings_percent === 'number' ? source.savings_percent : undefined,
+    transforms: Array.isArray(source.transforms) ? source.transforms.filter((item: unknown): item is string => typeof item === 'string') : undefined
+  };
+}
+
+async function compressWithHeadroomMcp(content: string): Promise<ScoutHeadroomCompression> {
+  const response = await fetch(scoutHeadroomMcpUrl(), {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      accept: 'application/json, text/event-stream'
+    },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: `quorum_scout_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`,
+      method: 'tools/call',
+      params: {
+        name: 'headroom_compress',
+        arguments: { content }
+      }
+    })
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`Headroom MCP compression failed with HTTP ${response.status}: ${truncateText(text, 300)}`);
+  }
+  const payload = parseJsonRpcPayload(text);
+  if (payload?.error) {
+    throw new Error(`Headroom MCP compression failed: ${payload.error.message || JSON.stringify(payload.error)}`);
+  }
+  return normalizeHeadroomCompression(payload?.result);
+}
+
+function compactScoutResult(params: {
+  result: ScoutDiscoverContextResult;
+  artifact: ScoutContextArtifact;
+  mode: Exclude<ScoutResponseMode, 'full'>;
+  headroom?: Record<string, unknown>;
+}): Record<string, unknown> {
+  const { result, artifact } = params;
+  return {
+    tool: 'scout_discover_context',
+    response_mode: params.mode,
+    scout_context_ref: artifact.contextRef,
+    context_digest: result.context_digest,
+    workspace_root: result.workspace_root,
+    artifact: {
+      relative_path: artifact.relativePath
+    },
+    retrieval: {
+      consult_council: {
+        argument: 'scout_context_ref',
+        value: artifact.contextRef
+      },
+      note: 'The full Scout context is stored server-side. Pass scout_context_ref to consult_council instead of pasting context.files content.'
+    },
+    context_manifest: result.context.files.map(file => ({
+      path: file.path,
+      sha256: file.sha256,
+      relevance: file.relevance,
+      start_line: file.start_line,
+      end_line: file.end_line,
+      total_lines: file.total_lines,
+      is_excerpt: file.is_excerpt,
+      size_chars: file.content.length
+    })),
+    structured_review: result.context.structured_review,
+    notes: result.context.notes,
+    recommended_files: result.recommended_files,
+    omitted_files: result.omitted_files,
+    warnings: result.warnings,
+    stats: result.stats,
+    ...(params.headroom ? { headroom: params.headroom } : {})
+  };
+}
+
+async function buildScoutToolResponse(result: ScoutDiscoverContextResult, args: any): Promise<ToolResponse> {
+  const mode = scoutResponseMode(args);
+  if (mode === 'full') {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(result, null, 2)
+        }
+      ],
+      structuredContent: result
+    };
+  }
+
+  const artifact = await saveScoutContextArtifact(result);
+
+  if (mode === 'compact') {
+    const compact = compactScoutResult({ result, artifact, mode });
+    return {
+      content: [{ type: 'text', text: JSON.stringify(compact, null, 2) }],
+      structuredContent: compact
+    };
+  }
+
+  const raw = JSON.stringify(result, null, 2);
+  const compressor: ScoutHeadroomCompressor = typeof args.headroomCompress === 'function'
+    ? args.headroomCompress
+    : compressWithHeadroomMcp;
+
+  try {
+    const compressed = await compressor(raw);
+    const compressedText = compressed.compressed || '';
+    const maxInlineChars = scoutHeadroomMaxInlineChars();
+    const effectiveInline = compressedText.length > 0 &&
+      compressedText.length <= maxInlineChars &&
+      compressedText.length < raw.length * 0.7;
+    const compact = compactScoutResult({
+      result,
+      artifact,
+      mode,
+      headroom: {
+        attempted: true,
+        status: 'compressed',
+        hash: compressed.hash,
+        original_tokens: compressed.original_tokens,
+        compressed_tokens: compressed.compressed_tokens,
+        savings_percent: compressed.savings_percent,
+        transforms: compressed.transforms,
+        inline_compressed: effectiveInline,
+        max_inline_chars: maxInlineChars,
+        ...(effectiveInline ? { compressed: compressedText } : {
+          omitted_compressed_reason: 'Headroom did not reduce the Scout payload enough to safely inline it without re-consuming context. Use the hash or scout_context_ref for retrieval.'
+        })
+      }
+    });
+    return {
+      content: [{ type: 'text', text: JSON.stringify(compact, null, 2) }],
+      structuredContent: compact
+    };
+  } catch (err) {
+    const compact = compactScoutResult({
+      result,
+      artifact,
+      mode,
+      headroom: {
+        attempted: true,
+        status: 'failed',
+        error: truncateText(errorMessage(err), 500)
+      }
+    });
+    return {
+      content: [{ type: 'text', text: JSON.stringify(compact, null, 2) }],
+      structuredContent: compact
+    };
+  }
 }
 
 export async function handleConsultCouncil(args: any): Promise<ToolResponse> {
@@ -128,7 +380,8 @@ export async function handleConsultCouncil(args: any): Promise<ToolResponse> {
   try {
     const selectedProviders = uniqueProviders(args.providers);
     requestedProviderCount = selectedProviders.length;
-    const validatedContext = validateCouncilContext(args.context, args.question);
+    const { context, workspaceRoot } = await resolveCouncilContext(args);
+    const validatedContext = validateCouncilContext(context, args.question, { workspaceRoot });
     contextDigest = validatedContext.context_digest;
 
     const result = await runCouncilConsultation({
@@ -223,15 +476,7 @@ export async function handleScoutDiscoverContext(args: any): Promise<ToolRespons
       contextDigest
     });
 
-    return {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify(result, null, 2)
-        }
-      ],
-      structuredContent: result
-    };
+    return buildScoutToolResponse(result, args);
   } catch (err: any) {
     DBService.failMcpToolCallMetric({
       toolCallId,
@@ -300,6 +545,7 @@ const materializeValidationTestsSchema = {
   objective: z.string().min(1),
   findings: z.array(validationTestFindingSchema).min(1),
   context: councilContextSchema,
+  workspace_root: z.string().optional(),
   test_framework: z.enum(['auto', 'node:test', 'vitest', 'jest', 'pytest']).optional(),
   target_test_dir: z.string().min(1).optional(),
   style_constraints: z.string().optional(),
@@ -422,7 +668,7 @@ export async function handleMaterializeValidationTests(args: any): Promise<ToolR
   try {
     const provider = selectValidationTestProvider(args.provider);
     requestedProviderCount = 1;
-    const validatedContext = validateCouncilContext(args.context, args.objective);
+    const validatedContext = validateCouncilContext(args.context, args.objective, { workspaceRoot: args.workspace_root });
     contextDigest = validatedContext.context_digest;
 
     const result = await runMaterializeValidationTests({

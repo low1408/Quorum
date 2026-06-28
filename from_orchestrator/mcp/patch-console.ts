@@ -1,9 +1,10 @@
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
 const workspaceRoot = process.env.COUNCIL_WORKSPACE_ROOT
   ? path.resolve(process.env.COUNCIL_WORKSPACE_ROOT)
-  : process.cwd();
+  : path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const logPath = path.resolve(workspaceRoot, 'quorum-mcp.log');
 
 function writeLog(level: string, ...args: any[]) {

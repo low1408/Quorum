@@ -73,6 +73,10 @@ export type CouncilStructuredReviewContext = {
   omitted_material: string;
 };
 
+export type CouncilContextValidationOptions = {
+  workspaceRoot?: string;
+};
+
 const MAX_FILE_CHARS = 250_000;
 const MAX_TOTAL_CHARS = 750_000;
 const STRUCTURED_REVIEW_FIELDS: Array<keyof CouncilStructuredReviewContext> = [
@@ -121,7 +125,11 @@ const EVIDENCE_ROLES = new Set<CouncilEvidenceRole>(['core', 'contract', 'config
 const EVIDENCE_PROVENANCE = new Set<CouncilEvidenceProvenance>(['repository', 'generated', 'test-runtime', 'caller-supplied']);
 const TEXT_FIELD_MAX_CHARS = 50_000;
 
-export function normalizeContextPath(rawPath: string): string {
+function validationWorkspaceRoot(options?: CouncilContextValidationOptions): string {
+  return path.resolve(options?.workspaceRoot || config.rootDir);
+}
+
+export function normalizeContextPath(rawPath: string, workspaceRoot = config.rootDir): string {
   if (typeof rawPath !== 'string' || rawPath.trim() === '') {
     throw new Error('Context file path must be a non-empty string.');
   }
@@ -131,10 +139,11 @@ export function normalizeContextPath(rawPath: string): string {
 
   if (path.isAbsolute(rawPath)) {
     const absolutePath = path.resolve(rawPath);
-    if (!absolutePath.startsWith(config.rootDir + path.sep) && absolutePath !== config.rootDir) {
+    const resolvedWorkspaceRoot = path.resolve(workspaceRoot);
+    if (!absolutePath.startsWith(resolvedWorkspaceRoot + path.sep) && absolutePath !== resolvedWorkspaceRoot) {
       throw new Error(`Context file path escapes the workspace: ${rawPath}`);
     }
-    return path.relative(config.rootDir, absolutePath).replace(/\\/g, '/');
+    return path.relative(resolvedWorkspaceRoot, absolutePath).replace(/\\/g, '/');
   }
 
   const normalized = path.posix.normalize(rawPath.replace(/\\/g, '/'));
@@ -283,7 +292,7 @@ export function referencedRepositoryPaths(text: string): string[] {
   return text.match(/[A-Za-z0-9_./-]+\.(?:ts|tsx|js|jsx|json|md|yml|yaml)/g) || [];
 }
 
-function validateEvidenceManifest(context: CouncilContext): Map<string, CouncilEvidenceManifestItem> {
+function validateEvidenceManifest(context: CouncilContext, workspaceRoot: string): Map<string, CouncilEvidenceManifestItem> {
   const manifest = context.evidence_manifest;
   if (manifest === undefined) return new Map();
   if (!Array.isArray(manifest)) {
@@ -306,7 +315,7 @@ function validateEvidenceManifest(context: CouncilContext): Map<string, CouncilE
     }
     seenIds.add(id);
 
-    const normalizedPath = normalizeContextPath(validateTextField(item.path, `Evidence manifest item ${id} path`, { required: true, maxChars: 2_000 })!);
+    const normalizedPath = normalizeContextPath(validateTextField(item.path, `Evidence manifest item ${id} path`, { required: true, maxChars: 2_000 })!, workspaceRoot);
     assertSafeContextPath(normalizedPath);
     if (!EVIDENCE_ROLES.has(item.role)) {
       throw new Error(`Evidence manifest item ${id} has invalid role: ${String(item.role)}`);
@@ -397,14 +406,14 @@ export function resolveLikelyImportPath(fromFile: string, importPath: string): s
   ]);
 }
 
-function addCompletenessWarnings(files: Array<CouncilContextFile & { normalizedPath: string }>, question: string, warnings: string[]): void {
+function addCompletenessWarnings(files: Array<CouncilContextFile & { normalizedPath: string }>, question: string, warnings: string[], workspaceRoot: string): void {
   const included = new Set(files.map(file => file.normalizedPath));
   const localImports = new Set<string>();
 
   for (const file of files) {
     for (const importPath of candidateImportPaths(file.content)) {
       for (const candidate of resolveLikelyImportPath(file.normalizedPath, importPath)) {
-        const absolute = path.resolve(config.rootDir, candidate);
+        const absolute = path.resolve(workspaceRoot, candidate);
         if (!included.has(candidate) && fs.existsSync(absolute) && fs.statSync(absolute).isFile()) {
           localImports.add(candidate);
           break;
@@ -422,7 +431,7 @@ function addCompletenessWarnings(files: Array<CouncilContextFile & { normalizedP
   const hasTsOrJs = files.some(file => /\.(?:ts|tsx|js|jsx)$/.test(file.normalizedPath));
   if (codeChangeIntent && hasTsOrJs) {
     for (const configFile of ['package.json', 'tsconfig.json']) {
-      if (!included.has(configFile) && fs.existsSync(path.resolve(config.rootDir, configFile))) {
+      if (!included.has(configFile) && fs.existsSync(path.resolve(workspaceRoot, configFile))) {
         warnings.push(`Context may be incomplete: ${configFile} exists but was not included.`);
       }
     }
@@ -430,28 +439,28 @@ function addCompletenessWarnings(files: Array<CouncilContextFile & { normalizedP
 
   const referencedPaths = referencedRepositoryPaths(question);
   for (const referencedPath of referencedPaths) {
-    const normalized = normalizeContextPath(referencedPath);
-    if (!included.has(normalized) && fs.existsSync(path.resolve(config.rootDir, normalized))) {
+    const normalized = normalizeContextPath(referencedPath, workspaceRoot);
+    if (!included.has(normalized) && fs.existsSync(path.resolve(workspaceRoot, normalized))) {
       warnings.push(`Question references ${normalized}, but that file was not included in context.`);
     }
   }
 }
 
-function addStructuredContextWarnings(context: CouncilStructuredReviewContext | undefined, files: Array<CouncilContextFile & { normalizedPath: string }>, warnings: string[]): void {
+function addStructuredContextWarnings(context: CouncilStructuredReviewContext | undefined, files: Array<CouncilContextFile & { normalizedPath: string }>, warnings: string[], workspaceRoot: string): void {
   if (!context) return;
 
   const included = new Set(files.map(file => file.normalizedPath));
   for (const field of ['core_evidence', 'supporting_contracts'] as const) {
     for (const referencedPath of referencedRepositoryPaths(context[field])) {
-      const normalized = normalizeContextPath(referencedPath);
-      if (!included.has(normalized) && fs.existsSync(path.resolve(config.rootDir, normalized))) {
+      const normalized = normalizeContextPath(referencedPath, workspaceRoot);
+      if (!included.has(normalized) && fs.existsSync(path.resolve(workspaceRoot, normalized))) {
         warnings.push(`Structured review field ${field} references ${normalized}, but that file was not included in context.`);
       }
     }
   }
 
   for (const referencedPath of referencedRepositoryPaths(context.omitted_material)) {
-    const normalized = normalizeContextPath(referencedPath);
+    const normalized = normalizeContextPath(referencedPath, workspaceRoot);
     if (included.has(normalized)) {
       warnings.push(`Structured review omitted_material says ${normalized} is omitted, but it was included in context.`);
     }
@@ -463,7 +472,8 @@ export function validateCouncilRequestText(question: string, constraints?: strin
   validateTextField(constraints, 'Constraints');
 }
 
-export function validateCouncilContext(context: CouncilContext, question = ''): ValidatedCouncilContext {
+export function validateCouncilContext(context: CouncilContext, question = '', options?: CouncilContextValidationOptions): ValidatedCouncilContext {
+  const workspaceRoot = validationWorkspaceRoot(options);
   if (!context || typeof context !== 'object' || !Array.isArray(context.files)) {
     throw new Error('Context must include a files array.');
   }
@@ -478,7 +488,7 @@ export function validateCouncilContext(context: CouncilContext, question = ''): 
   const contentHashes = new Map<string, string>();
   const warnings: string[] = [];
   const structuredReview = validateStructuredReviewContext(context, warnings);
-  const manifestByPath = validateEvidenceManifest(context);
+  const manifestByPath = validateEvidenceManifest(context, workspaceRoot);
   const unresolvedManifestPaths = new Set(manifestByPath.keys());
   const files: ValidatedCouncilContext['files'] = [];
   let totalChars = structuredReview
@@ -494,7 +504,7 @@ export function validateCouncilContext(context: CouncilContext, question = ''): 
       throw new Error('Context file must be an object.');
     }
     assertNoUnknownKeys(file as unknown as Record<string, unknown>, CONTEXT_FILE_KEYS, 'Context file');
-    const normalizedPath = normalizeContextPath(file.path);
+    const normalizedPath = normalizeContextPath(file.path, workspaceRoot);
     assertSafeContextPath(normalizedPath);
     if (seen.has(normalizedPath)) {
       throw new Error(`Duplicate context file: ${normalizedPath}`);
@@ -537,8 +547,8 @@ export function validateCouncilContext(context: CouncilContext, question = ''): 
       throw new Error(`Context file hash is stale or incorrect: ${normalizedPath}`);
     }
 
-    const absolutePath = path.resolve(config.rootDir, normalizedPath);
-    if (!absolutePath.startsWith(config.rootDir + path.sep) && absolutePath !== config.rootDir) {
+    const absolutePath = path.resolve(workspaceRoot, normalizedPath);
+    if (!absolutePath.startsWith(workspaceRoot + path.sep) && absolutePath !== workspaceRoot) {
       throw new Error(`Context file path escapes the workspace: ${normalizedPath}`);
     }
     if (fs.existsSync(absolutePath)) {
@@ -609,8 +619,8 @@ export function validateCouncilContext(context: CouncilContext, question = ''): 
     return a.normalizedPath.localeCompare(b.normalizedPath);
   });
 
-  addCompletenessWarnings(files, `${question}\n${context.notes || ''}`, warnings);
-  addStructuredContextWarnings(structuredReview, files, warnings);
+  addCompletenessWarnings(files, `${question}\n${context.notes || ''}`, warnings, workspaceRoot);
+  addStructuredContextWarnings(structuredReview, files, warnings, workspaceRoot);
   const dedupedWarnings = Array.from(new Set(warnings));
 
   return {

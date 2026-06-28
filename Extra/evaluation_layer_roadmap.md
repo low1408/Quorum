@@ -1,5 +1,11 @@
 # Evaluation Layer Development Roadmap
 
+> [!NOTE]
+> **Current Status (As of June 25, 2026):**
+> - **Phase 0 (Baseline and Guardrails):** Completed. Config flags and baseline tests are verified.
+> - **Phase 1 (MCP Tool-Call Metrics):** Completed. `McpToolCallMetrics` table and database routines are implemented. Handlers (`consult_council`, `consult_council_mcq`, `scout_discover_context`, and `materialize_validation_tests`) are wrapped with metrics recording. Unit and integration tests pass successfully.
+> - **Next Up (Phase 2):** Implement typed context warning details.
+
 This roadmap turns `Extra/evaluation_layer_design.md` into a concrete implementation plan for the Quorum LLM Council repository.
 
 The first implementation should be deterministic, additive, and low-risk:
@@ -338,18 +344,18 @@ Goal: confirm current tests pass and document the non-goals.
 
 Tasks:
 
-- Run `npm test`.
-- Run `npm run typecheck`.
-- Add config flags:
+- [x] Run `npm test`.
+- [x] Run `npm run typecheck`.
+- [x] Add config flags:
   - `ENABLE_COUNCIL_EVALUATION`
   - `COUNCIL_EVALUATION_MODE`
   - `COUNCIL_EVALUATION_VERSION`
-- Default evaluation to enabled for deterministic inline metrics only, or disabled if you want zero behavior change before integration.
+- [x] Default evaluation to enabled for deterministic inline metrics only, or disabled if you want zero behavior change before integration.
 
 Definition of done:
 
-- Existing tests pass.
-- No existing output fields are removed or renamed.
+- [x] Existing tests pass.
+- [x] No existing output fields are removed or renamed.
 
 ## Phase 1: MCP Tool-Call Metrics
 
@@ -357,15 +363,15 @@ Goal: record the number of successful and failed Quorum MCP calls.
 
 Implementation:
 
-- Add `McpToolCallMetrics` schema to `initSchema()`.
-- Add DB methods:
+- [x] Add `McpToolCallMetrics` schema to `initSchema()`.
+- [x] Add DB methods:
   - `createMcpToolCallMetric(params)`
   - `completeMcpToolCallMetric(params)`
   - `failMcpToolCallMetric(params)`
   - `getMcpToolCallMetrics(params?)`
-- In `server.ts`, create a `tool_call_id` before validating `consult_council` and `consult_council_mcq`.
-- On validation failure, record `VALIDATION_FAILED`.
-- On completed result, record:
+- [x] In `server.ts`, create a `tool_call_id` before validating `consult_council` and `consult_council_mcq` (and also cover `scout_discover_context` and `materialize_validation_tests`).
+- [x] On validation failure, record `VALIDATION_FAILED`.
+- [x] On completed result, record:
   - `COMPLETED` or `PARTIAL_SUCCESS`
   - requested provider count
   - successful provider count
@@ -375,14 +381,14 @@ Implementation:
 
 Tests:
 
-- Invalid context produces a failed tool-call metric without a run.
-- Unsupported provider produces a failed metric and does not create a run.
-- Mock council success records `COMPLETED`.
-- Partial provider failure records `PARTIAL_SUCCESS`.
+- [x] Invalid context produces a failed tool-call metric without a run.
+- [x] Unsupported provider produces a failed metric and does not create a run.
+- [x] Mock council success records `COMPLETED`.
+- [x] Partial provider failure records `PARTIAL_SUCCESS`.
 
 Definition of done:
 
-- MCP success can be queried independently from provider/member success.
+- [x] MCP success can be queried independently from provider/member success.
 
 ## Phase 2: Typed Context Warning Details
 
@@ -390,7 +396,7 @@ Goal: make context warning metrics reliable without parsing human strings.
 
 Implementation:
 
-- Add a new type in `contextValidation.ts`:
+- [ ] Add a new type in `contextValidation.ts`:
 
 ```ts
 export type CouncilContextWarning = {
@@ -413,26 +419,26 @@ export type CouncilContextWarning = {
 };
 ```
 
-- Extend `ValidatedCouncilContext` with:
+- [ ] Extend `ValidatedCouncilContext` with:
 
 ```ts
 warnings: string[];
 warning_details: CouncilContextWarning[];
 ```
 
-- Preserve every existing warning string.
-- Refactor warning sites to push both string and structured detail.
+- [ ] Preserve every existing warning string.
+- [ ] Refactor warning sites to push both string and structured detail.
 
 Tests:
 
-- Existing `contextValidation.test.ts` assertions still pass.
-- New assertions verify stable `warning_details.code` values.
-- Duplicate content, missing import, missing config, stale mtime, and structured reference warnings are typed.
+- [ ] Existing `contextValidation.test.ts` assertions still pass.
+- [ ] New assertions verify stable `warning_details.code` values.
+- [ ] Duplicate content, missing import, missing config, stale mtime, and structured reference warnings are typed.
 
 Definition of done:
 
-- No caller is forced to migrate from `warnings`.
-- Metrics code can aggregate warning details without regexes.
+- [ ] No caller is forced to migrate from `warnings`.
+- [ ] Metrics code can aggregate warning details without regexes.
 
 ## Phase 3: Intrinsic Context Quality Metrics
 

@@ -75,6 +75,12 @@ Start the MCP server:
 npm run mcp:start
 ```
 
+When registering the MCP server with an IDE or host application, set `COUNCIL_WORKSPACE_ROOT` to this repository path if the host launches commands from another directory:
+
+```bash
+COUNCIL_WORKSPACE_ROOT=/absolute/path/to/quorum-llm-council npm run mcp:start
+```
+
 Run tests:
 
 ```bash

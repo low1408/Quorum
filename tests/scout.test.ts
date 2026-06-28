@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
 import { config } from '../from_orchestrator/config/index.ts';
 import { DBService, initSchema } from '../from_orchestrator/db/database.ts';
-import { handleScoutDiscoverContext } from '../from_orchestrator/mcp/server.ts';
+import { handleConsultCouncil, handleScoutDiscoverContext } from '../from_orchestrator/mcp/server.ts';
 import {
   discoverScoutContext,
   discoverScoutContextWithLlm,
@@ -309,15 +311,107 @@ test('scout_discover_context MCP handler returns structured context and records 
   assert.equal(metrics[0].context_digest, result.context_digest);
 });
 
+test('scout_discover_context compact response returns a context ref without raw file contents', async () => {
+  const response = await handleScoutDiscoverContext({
+    query: 'Review from_orchestrator/security/encryption.ts',
+    entrypoints: ['from_orchestrator/security/encryption.ts'],
+    include_reverse_importers: false,
+    include_tests: false,
+    response_mode: 'compact'
+  });
+
+  const result = response.structuredContent;
+  const serialized = JSON.stringify(result);
+  assert.equal(result.response_mode, 'compact');
+  assert.match(result.scout_context_ref, /^scout:[a-f0-9]{64}$/);
+  assert.equal('context' in result, false);
+  assert.ok(result.context_manifest.some((file: any) => file.path === 'from_orchestrator/security/encryption.ts'));
+  assert.equal(result.context_manifest.some((file: any) => 'content' in file), false);
+  assert.equal(serialized.includes('multi_llm_orchestrator_salt_constant'), false);
+  assert.equal(response.content[0].text.includes('multi_llm_orchestrator_salt_constant'), false);
+
+  const councilResponse = await handleConsultCouncil({
+    question: 'Review from_orchestrator/security/encryption.ts',
+    scout_context_ref: result.scout_context_ref,
+    providers: ['mock'],
+    max_retries: 0
+  });
+
+  assert.equal(councilResponse.structuredContent.status, 'COMPLETED');
+  assert.match(councilResponse.structuredContent.report, /Mock Response/);
+});
+
+test('scout_discover_context can scan and hand off a different repository root', async () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'quorum-scout-external-'));
+  fs.mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(repoRoot, 'package.json'), JSON.stringify({ name: 'external-fixture' }), 'utf8');
+  fs.writeFileSync(
+    path.join(repoRoot, 'src', 'index.ts'),
+    'export function externalValue() { return 42; }\n',
+    'utf8'
+  );
+
+  const response = await handleScoutDiscoverContext({
+    query: 'Review src/index.ts',
+    repo_root: repoRoot,
+    entrypoints: ['src/index.ts'],
+    include_reverse_importers: false,
+    include_tests: false,
+    response_mode: 'compact'
+  });
+
+  const result = response.structuredContent;
+  assert.equal(result.workspace_root, repoRoot);
+  assert.ok(result.context_manifest.some((file: any) => file.path === 'src/index.ts'));
+  assert.equal(JSON.stringify(result).includes('externalValue'), false);
+
+  const councilResponse = await handleConsultCouncil({
+    question: 'Review src/index.ts',
+    scout_context_ref: result.scout_context_ref,
+    providers: ['mock'],
+    max_retries: 0
+  });
+
+  assert.equal(councilResponse.structuredContent.status, 'COMPLETED');
+  assert.match(councilResponse.structuredContent.report, /externalValue/);
+});
+
+test('scout_discover_context headroom response does not inline ineffective compression', async () => {
+  const response = await handleScoutDiscoverContext({
+    query: 'Review from_orchestrator/security/encryption.ts',
+    entrypoints: ['from_orchestrator/security/encryption.ts'],
+    include_reverse_importers: false,
+    include_tests: false,
+    response_mode: 'headroom',
+    headroomCompress: async (content: string) => ({
+      compressed: content,
+      hash: 'headroom-test-hash',
+      original_tokens: 833,
+      compressed_tokens: 833,
+      savings_percent: 0,
+      transforms: ['router:protected:error_output']
+    })
+  });
+
+  const result = response.structuredContent;
+  const serialized = JSON.stringify(result);
+  assert.equal(result.response_mode, 'headroom');
+  assert.equal(result.headroom.hash, 'headroom-test-hash');
+  assert.equal(result.headroom.inline_compressed, false);
+  assert.equal('compressed' in result.headroom, false);
+  assert.equal('context' in result, false);
+  assert.equal(serialized.includes('multi_llm_orchestrator_salt_constant'), false);
+});
+
 test('scout_discover_context MCP handler rejects invalid inputs before discovery succeeds', async () => {
   const before = scoutMetricIdsBefore();
 
   await assert.rejects(
     handleScoutDiscoverContext({
       query: 'Review package.json',
-      repo_root: path.resolve(config.rootDir, '..')
+      repo_root: path.resolve(config.rootDir, 'package.json')
     }),
-    /repo_root must match/
+    /repo_root must be a directory/
   );
 
   await assert.rejects(

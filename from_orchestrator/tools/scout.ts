@@ -57,6 +57,7 @@ export type ScoutOmittedFile = {
 export type ScoutDiscoverContextResult = {
   context: CouncilContext;
   context_digest: string;
+  workspace_root: string;
   recommended_files: ScoutRecommendedFile[];
   omitted_files: ScoutOmittedFile[];
   warnings: string[];
@@ -200,13 +201,15 @@ function clampInteger(value: number | undefined, fallback: number, min: number, 
   return value;
 }
 
-function assertWorkspaceRoot(repoRoot?: string): void {
-  if (!repoRoot) return;
-  const requestedRoot = path.resolve(repoRoot);
-  const configuredRoot = path.resolve(config.rootDir);
-  if (requestedRoot !== configuredRoot) {
-    throw new Error(`Scout repo_root must match configured workspace root: ${configuredRoot}`);
+function resolveScoutWorkspaceRoot(repoRoot?: string): string {
+  const workspaceRoot = path.resolve(repoRoot || config.rootDir);
+  if (!fs.existsSync(workspaceRoot)) {
+    throw new Error(`Scout repo_root does not exist: ${workspaceRoot}`);
   }
+  if (!fs.statSync(workspaceRoot).isDirectory()) {
+    throw new Error(`Scout repo_root must be a directory: ${workspaceRoot}`);
+  }
+  return workspaceRoot;
 }
 
 function isExcludedPath(relativePath: string): boolean {
@@ -251,7 +254,7 @@ function isExcludedPath(relativePath: string): boolean {
 function isLikelyTextPath(relativePath: string): boolean {
   const basename = path.posix.basename(relativePath.toLowerCase());
   if (basename === '.env.example' || basename === 'env.example') return true;
-  return /\.(?:cjs|cts|d\.ts|js|json|jsx|md|mjs|mts|ts|tsx|txt|yaml|yml)$/.test(relativePath);
+  return /\.(?:cjs|cts|d\.ts|js|json|jsx|md|mjs|mts|ts|tsx|txt|yaml|yml|py)$/.test(relativePath);
 }
 
 function scanRepository(rootDir: string): Map<string, RepoFile> {
@@ -793,6 +796,7 @@ function repairPathsFromWarnings(warnings: string[], selectedPaths: Set<string>,
 
 type ScoutWorkingState = {
   query: string;
+  workspaceRoot: string;
   tokenBudgetChars: number;
   repoFiles: Map<string, RepoFile>;
   candidates: Map<string, Candidate>;
@@ -809,7 +813,7 @@ type ScoutFinalizedContext = {
 function collectScoutContextState(args: ScoutDiscoverContextArgs): ScoutWorkingState {
   const query = args.query;
   validateCouncilRequestText(query);
-  assertWorkspaceRoot(args.repo_root);
+  const workspaceRoot = resolveScoutWorkspaceRoot(args.repo_root);
 
   const tokenBudgetChars = clampInteger(
     args.token_budget_chars,
@@ -826,7 +830,7 @@ function collectScoutContextState(args: ScoutDiscoverContextArgs): ScoutWorkingS
   const includeTests = args.include_tests !== false;
   const includeReverseImporters = args.include_reverse_importers !== false;
 
-  const repoFiles = scanRepository(config.rootDir);
+  const repoFiles = scanRepository(workspaceRoot);
   const candidates = new Map<string, Candidate>();
   const baseOmissions = new Map<string, ScoutOmittedFile>();
   const warnings: string[] = [];
@@ -893,6 +897,7 @@ function collectScoutContextState(args: ScoutDiscoverContextArgs): ScoutWorkingS
 
   return {
     query,
+    workspaceRoot,
     tokenBudgetChars,
     repoFiles,
     candidates,
@@ -939,7 +944,7 @@ function finalizeScoutContext(state: ScoutWorkingState, overrides?: {
     baseOmissions: state.baseOmissions
   });
   let context = buildContextForSelection(state, selection, overrides);
-  let validated = validateCouncilContext(context, state.query);
+  let validated = validateCouncilContext(context, state.query, { workspaceRoot: state.workspaceRoot });
 
   const repairPaths = repairPathsFromWarnings(
     validated.warnings,
@@ -970,7 +975,7 @@ function finalizeScoutContext(state: ScoutWorkingState, overrides?: {
       baseOmissions: state.baseOmissions
     });
     context = buildContextForSelection(state, selection, overrides);
-    validated = validateCouncilContext(context, state.query);
+    validated = validateCouncilContext(context, state.query, { workspaceRoot: state.workspaceRoot });
   }
 
   return { selection, context, validated };
@@ -987,6 +992,7 @@ function buildScoutResult(params: {
   return {
     context: finalized.context,
     context_digest: finalized.validated.context_digest,
+    workspace_root: state.workspaceRoot,
     recommended_files: selectedForOutput([...finalized.selection.selected], state.repoFiles),
     omitted_files: Array.from(finalized.selection.omitted.values()).sort((a, b) => a.path.localeCompare(b.path)),
     warnings: dedupeWarnings([...state.warnings, ...finalized.validated.warnings, ...(params.warnings || [])]),
@@ -1021,6 +1027,7 @@ function cloneWorkingState(state: ScoutWorkingState): ScoutWorkingState {
 
   return {
     query: state.query,
+    workspaceRoot: state.workspaceRoot,
     tokenBudgetChars: state.tokenBudgetChars,
     repoFiles: state.repoFiles,
     candidates,
@@ -1394,7 +1401,7 @@ export async function discoverScoutContextWithLlm(
         notes: LLM_FULL_BRIEFING_NOTES,
         structuredReview
       });
-      const fullValidated = validateCouncilContext(fullContext, llmState.query);
+      const fullValidated = validateCouncilContext(fullContext, llmState.query, { workspaceRoot: llmState.workspaceRoot });
       return buildScoutResult({
         state: llmState,
         finalized: {

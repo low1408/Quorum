@@ -1,14 +1,22 @@
 import dotenv from 'dotenv';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
-const rootDir = process.env.COUNCIL_WORKSPACE_ROOT
+const defaultWorkspaceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const dotenvRoot = process.env.COUNCIL_WORKSPACE_ROOT
   ? path.resolve(process.env.COUNCIL_WORKSPACE_ROOT)
-  : process.cwd();
+  : defaultWorkspaceRoot;
 
 // Keep test runs hermetic; package scripts set the required test env explicitly.
 if (process.env.NODE_ENV !== 'test') {
-  dotenv.config({ path: path.resolve(rootDir, '.env') });
+  dotenv.config({ path: path.resolve(dotenvRoot, '.env') });
 }
+
+export function resolveWorkspaceRoot(value: string | undefined = process.env.COUNCIL_WORKSPACE_ROOT): string {
+  return value ? path.resolve(value) : defaultWorkspaceRoot;
+}
+
+const rootDir = resolveWorkspaceRoot();
 
 export function normalizeCdpEndpoint(value: string | undefined): string {
   const endpoint = value?.trim() || '';

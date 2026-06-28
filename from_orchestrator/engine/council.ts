@@ -99,16 +99,11 @@ export function renderRepositoryEvidence(context: ValidatedCouncilContext): stri
     const content = lineNumberContent(file.content, file.startLine);
     return [
       `<<<SOURCE ${sourceNo}`,
-      `id=${file.evidenceId}`,
       `path=${file.normalizedPath}`,
-      `sha256=${file.computedSha256}`,
       `role=${file.role}`,
       `provenance=${file.provenance}`,
       `relevance=${file.relevance || 'unspecified'}`,
-      `range=${file.startLine}-${file.endLine}`,
-      `total_lines=${file.totalLines}`,
       `excerpt=${file.isExcerpt}`,
-      `length_chars=${file.content.length}`,
       '>>>',
       content,
       `<<<END SOURCE ${sourceNo}>>>`
@@ -120,7 +115,7 @@ export function reviewerContract(): string {
   return [
     'REQUIRED REVIEWER FORMAT:',
     'Classify each finding as exactly one of: Confirmed defect, Likely defect, Architectural risk, Hardening recommendation, Unverifiable.',
-    'For every finding include: severity, confidence, exact path:line evidence, reasoning, missing context, and a validation test.',
+    'For every finding include: severity, confidence, exact path:line evidence and code symbol (like a function name) , reasoning, missing context, and a validation test.',
     'Claims without exact supporting evidence from the supplied repository context must be classified as Unverifiable.',
     'Do not treat validation or completeness warnings as defects unless source evidence independently supports the finding.'
   ].join('\n');
@@ -157,7 +152,6 @@ export function buildCouncilAnalysisPrompt(params: {
     params.constraints ? `CONSTRAINTS:\n${params.constraints}` : '',
     params.context.notes ? `CALLER CONTEXT NOTES:\n${params.context.notes}` : '',
     structured ? `STRUCTURED REVIEW CONTEXT:\n${structured}` : '',
-    `CONTEXT DIGEST:\n${params.context.context_digest}`,
     warnings,
     `REPOSITORY EVIDENCE:\n${repositoryEvidence}`
   ].filter(Boolean).join('\n\n');
