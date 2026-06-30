@@ -1,6 +1,7 @@
-import type { Page, BrowserContext, Response } from 'playwright';
+import type { Page, BrowserContext } from 'playwright';
 import type { BrowserAdapter, AnomalyType, HealthStatus, BrowserOperationOptions } from './base.ts';
 import { config } from '../config/index.ts';
+import { ConversationResponseTracker, waitForAbortablePageTimeout } from './browserLifecycle.ts';
 
 /**
  * Premium, OOP-driven abstract class implementing shared browser automation
@@ -24,8 +25,7 @@ export abstract class BaseBrowserAdapter implements BrowserAdapter {
 
   // Optional network interception configuration
   protected conversationUrlPart?: string;
-  protected activeConversationResponse: Promise<Response> | null = null;
-  protected responseResolver: ((val: Response) => void) | null = null;
+  private readonly conversationResponseTracker = new ConversationResponseTracker();
 
   // Tracks the DOM node index where the latest response starts.
   // Set by awaitNetworkCompletion, consumed by extractAndNormalizeAST.
@@ -63,20 +63,7 @@ export abstract class BaseBrowserAdapter implements BrowserAdapter {
    * Captures the network conversation event before trigger to race streaming responses.
    */
   protected setupConversationListener(page: Page): void {
-    if (!this.conversationUrlPart) return;
-
-    this.activeConversationResponse = new Promise<Response>((resolve) => {
-      this.responseResolver = resolve;
-    });
-
-    page.on('response', (response) => {
-      if (response.url().includes(this.conversationUrlPart!) && response.request().method() === 'POST') {
-        if (this.responseResolver) {
-          this.responseResolver(response);
-          this.responseResolver = null;
-        }
-      }
-    });
+    this.conversationResponseTracker.arm(page, this.conversationUrlPart);
   }
 
   /**
@@ -238,9 +225,6 @@ export abstract class BaseBrowserAdapter implements BrowserAdapter {
    * Safe typing of prompt and clicking send button.
    */
   public async dispatchPrompt(page: Page, prompt: string, options?: BrowserOperationOptions & { suppressPasteOnlyLog?: boolean }): Promise<void> {
-    // Pre-setup network listener if active for this provider
-    this.setupConversationListener(page);
-
     await page.waitForSelector(this.textareaSelector, { state: 'visible', timeout: 15000 });
     
     // Bring the tab to focus so the user can see and interact with it
@@ -337,6 +321,9 @@ export abstract class BaseBrowserAdapter implements BrowserAdapter {
       }
       return;
     }
+
+    // Arm immediately before submission so paste-only operations never leak listeners.
+    this.setupConversationListener(page);
 
     // Small delay before clicking send for realism
     await new Promise(resolve => setTimeout(resolve, 1000));
@@ -523,20 +510,7 @@ export abstract class BaseBrowserAdapter implements BrowserAdapter {
           }
         }
 
-        await Promise.race([
-          page.waitForTimeout(500),
-          new Promise<void>((_, reject) => {
-            if (!options.signal) return;
-            const onAbort = () => {
-              options.signal?.removeEventListener('abort', onAbort);
-              const err = new Error(options.signal?.reason instanceof Error ? options.signal.reason.message : 'Operation cancelled.');
-              err.name = 'AbortError';
-              (err as any).code = 'CANCELLED';
-              reject(err);
-            };
-            options.signal.addEventListener('abort', onAbort, { once: true });
-          })
-        ]);
+        await waitForAbortablePageTimeout(page, 500, options.signal);
       }
     })();
 
@@ -544,8 +518,9 @@ export abstract class BaseBrowserAdapter implements BrowserAdapter {
     // fully committed to the DOM. Treat it as diagnostic signal only; extraction
     // must wait for DOM text/button stability or it can capture only the first
     // few tokens of long ChatGPT answers.
-    const networkPromise = this.activeConversationResponse
-      ? this.activeConversationResponse.then(async response => {
+    const activeConversationResponse = this.conversationResponseTracker.response;
+    const networkPromise = activeConversationResponse
+      ? activeConversationResponse.then(async response => {
         await response.finished().catch(() => {});
         console.log(`[STREAMING] ${this.providerId.toUpperCase()} network stream finished; waiting for DOM stability before extraction.`);
       }).catch((err) => {
@@ -557,13 +532,19 @@ export abstract class BaseBrowserAdapter implements BrowserAdapter {
       void networkPromise;
     }
 
+    let generationTimeout: NodeJS.Timeout | undefined;
     try {
       await Promise.race([
         domPromise.catch((err) => {
           if (active) console.log(`[STREAMING] DOM tracker info: ${err.message}`);
           throw err;
         }),
-        new Promise<void>((_, reject) => setTimeout(() => reject(new Error(`Generation timed out after ${outputStabilizationMs}ms`)), outputStabilizationMs))
+        new Promise<void>((_, reject) => {
+          generationTimeout = setTimeout(
+            () => reject(new Error(`Generation timed out after ${outputStabilizationMs}ms`)),
+            outputStabilizationMs
+          );
+        })
       ]);
     } catch (err: any) {
       const anomaly = await this.detectAnomaly(page, err).catch(() => 'UNKNOWN');
@@ -573,7 +554,8 @@ export abstract class BaseBrowserAdapter implements BrowserAdapter {
       throw err;
     } finally {
       active = false;
-      this.activeConversationResponse = null;
+      if (generationTimeout) clearTimeout(generationTimeout);
+      this.conversationResponseTracker.clear();
     }
   }
 
