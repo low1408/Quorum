@@ -2,7 +2,7 @@ import { chromium } from 'playwright-extra';
 import stealthPlugin from 'puppeteer-extra-plugin-stealth';
 import type { Browser, BrowserContext, Page } from 'playwright';
 import type { BrowserAdapter } from '../adapters/base.ts';
-import { createAdapter } from '../adapters/registry.ts';
+import { createAdapter, type ProviderRegistry } from '../adapters/registry.ts';
 import { SessionManager } from '../security/sessionManager.ts';
 import { DBService } from '../db/database.ts';
 import { config } from '../config/index.ts';
@@ -116,9 +116,9 @@ export class OrchestrationRunner {
     runId: string,
     taskId: string,
     providerId: string = 'chatgpt',
-    options: { manageRunStatus?: boolean } = {}
+    options: { manageRunStatus?: boolean; providerRegistry?: ProviderRegistry } = {}
   ) {
-    this.adapter = getAdapter(providerId);
+    this.adapter = options.providerRegistry?.create(providerId) ?? getAdapter(providerId);
     this.runId = runId;
     this.taskId = taskId;
     this.stateStartTime = Date.now();
