@@ -97,15 +97,32 @@ export async function closeSessionItem(item: SessionPoolItem, reason = 'cleanup'
   item.browser = null;
   item.hasActiveThread = false;
 
+  const errors: string[] = [];
   if (page && ownsPage) {
-    console.log(`[KEEP-ALIVE] Keeping page open (requested close reason: ${reason})`);
+    try {
+      if (!page.isClosed()) await page.close();
+    } catch (error) {
+      errors.push(`page: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   if (context && ownsContext) {
-    console.log(`[KEEP-ALIVE] Keeping context open (requested close reason: ${reason})`);
+    try {
+      await context.close();
+    } catch (error) {
+      errors.push(`context: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   if (browser && ownsBrowser) {
-    console.log(`[KEEP-ALIVE] Keeping browser open (requested close reason: ${reason})`);
+    try {
+      await browser.close();
+    } catch (error) {
+      errors.push(`browser: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  if (errors.length > 0) {
+    throw new Error(`Failed to close owned session resources (${reason}): ${errors.join('; ')}`);
   }
 }
