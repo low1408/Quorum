@@ -46,17 +46,19 @@ export type CouncilAnalysis = {
 export type CouncilRunner = ProviderTaskRunner;
 export type CouncilRunnerFactory = ProviderTaskRunnerFactory;
 
-const DEFAULT_PROVIDERS = (process.env.COUNCIL_PROVIDERS || 'chatgpt,gemini,meta,kimi')
-  .split(',')
-  .map(provider => provider.trim())
-  .filter(Boolean);
+export function defaultCouncilProviders(env: NodeJS.ProcessEnv = process.env): string[] {
+  return (env.COUNCIL_PROVIDERS || 'chatgpt,gemini,meta,kimi')
+    .split(',')
+    .map(provider => provider.trim())
+    .filter(Boolean);
+}
 
 // Node timers are capped at a signed 32-bit integer. This is the longest
 // practical timeout without triggering TimeoutOverflowWarning timer clamping.
 export const EFFECTIVELY_INFINITE_TIMEOUT_MS = 2_147_483_647;
 
 export function uniqueProviders(providers?: string[]): string[] {
-  const selected = providers?.length ? providers : DEFAULT_PROVIDERS;
+  const selected = providers?.length ? providers : defaultCouncilProviders();
   return validateProviderList(selected.map(normalizeProviderId), 'council providers');
 }
 

@@ -16,8 +16,6 @@ export function resolveWorkspaceRoot(value: string | undefined = process.env.COU
   return value ? path.resolve(value) : defaultWorkspaceRoot;
 }
 
-const rootDir = resolveWorkspaceRoot();
-
 export function normalizeCdpEndpoint(value: string | undefined): string {
   const endpoint = value?.trim() || '';
   if (!endpoint) return '';
@@ -49,20 +47,46 @@ export function requireEncryptionKey(value: string | undefined = process.env.ENC
   return key;
 }
 
-export const config = {
-  encryptionKey: process.env.ENCRYPTION_KEY,
-  databasePath: process.env.DATABASE_PATH ? path.resolve(rootDir, process.env.DATABASE_PATH) : path.resolve(rootDir, './orchestrator.db'),
-  headless: shouldLaunchHeadless(process.env.HEADLESS),
-  cdpEndpoint: normalizeCdpEndpoint(process.env.CDP_ENDPOINT),
-  evaluatorProvider: process.env.EVALUATOR_PROVIDER || 'gemini',
-  enableSummaryEvaluation: false,
-  enableCouncilEvaluation: process.env.ENABLE_COUNCIL_EVALUATION !== 'false',
-  councilEvaluationMode: process.env.COUNCIL_EVALUATION_MODE || 'inline',
-  councilEvaluationVersion: process.env.COUNCIL_EVALUATION_VERSION || 'deterministic-v1',
-  humanTyping: process.env.HUMAN_TYPING !== 'false',
-  chatgptBaseUrl: process.env.CHATGPT_BASE_URL || 'https://chatgpt.com',
-  sessionStorageDir: path.resolve(rootDir, './sessions'),
-  limitDebateResponses: process.env.LIMIT_DEBATE_RESPONSES !== 'false',
-  requireStructuredReviewContext: process.env.REQUIRE_STRUCTURED_REVIEW_CONTEXT === 'true',
-  rootDir,
-};
+export type RuntimeConfig = Readonly<{
+  encryptionKey?: string;
+  databasePath: string;
+  headless: boolean;
+  cdpEndpoint: string;
+  evaluatorProvider: string;
+  enableSummaryEvaluation: boolean;
+  enableCouncilEvaluation: boolean;
+  councilEvaluationMode: string;
+  councilEvaluationVersion: string;
+  humanTyping: boolean;
+  chatgptBaseUrl: string;
+  sessionStorageDir: string;
+  limitDebateResponses: boolean;
+  requireStructuredReviewContext: boolean;
+  rootDir: string;
+}>;
+
+export function createRuntimeConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform
+): RuntimeConfig {
+  const rootDir = resolveWorkspaceRoot(env.COUNCIL_WORKSPACE_ROOT);
+  return Object.freeze({
+    encryptionKey: env.ENCRYPTION_KEY,
+    databasePath: env.DATABASE_PATH ? path.resolve(rootDir, env.DATABASE_PATH) : path.resolve(rootDir, './orchestrator.db'),
+    headless: shouldLaunchHeadless(env.HEADLESS, env, platform),
+    cdpEndpoint: normalizeCdpEndpoint(env.CDP_ENDPOINT),
+    evaluatorProvider: env.EVALUATOR_PROVIDER || 'gemini',
+    enableSummaryEvaluation: false,
+    enableCouncilEvaluation: env.ENABLE_COUNCIL_EVALUATION !== 'false',
+    councilEvaluationMode: env.COUNCIL_EVALUATION_MODE || 'inline',
+    councilEvaluationVersion: env.COUNCIL_EVALUATION_VERSION || 'deterministic-v1',
+    humanTyping: env.HUMAN_TYPING !== 'false',
+    chatgptBaseUrl: env.CHATGPT_BASE_URL || 'https://chatgpt.com',
+    sessionStorageDir: path.resolve(rootDir, './sessions'),
+    limitDebateResponses: env.LIMIT_DEBATE_RESPONSES !== 'false',
+    requireStructuredReviewContext: env.REQUIRE_STRUCTURED_REVIEW_CONTEXT === 'true',
+    rootDir
+  });
+}
+
+export const config = createRuntimeConfig();

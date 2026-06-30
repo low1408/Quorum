@@ -3,7 +3,6 @@ import test from 'node:test';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { config } from '../from_orchestrator/config/index.ts';
 import { validateCouncilContext, validateCouncilRequestText } from '../from_orchestrator/mcp/contextValidation.ts';
 
 function digest(value: string): string {
@@ -76,7 +75,7 @@ test('rejects unknown fields, unsafe request text, unsafe metadata, and sensitiv
 });
 
 test('detects disk-stale hashes and warns about missing local imports', () => {
-  const packagePath = path.resolve(config.rootDir, 'package.json');
+  const packagePath = path.resolve(process.cwd(), 'package.json');
   const wrongContent = '{"name":"not-current"}';
   assert.ok(fs.existsSync(packagePath), 'package.json fixture should exist after scaffolding');
   assert.throws(
@@ -228,57 +227,40 @@ test('rejects malformed evidence manifests', () => {
 });
 
 test('structured review context is optional unless enforcement is enabled', () => {
-  const previous = config.requireStructuredReviewContext;
-  config.requireStructuredReviewContext = false;
-  try {
-    const validation = validateCouncilContext({
-      files: [{ path: 'virtual.ts', content: 'export const value = 1;' }]
-    });
+  const validation = validateCouncilContext({
+    files: [{ path: 'virtual.ts', content: 'export const value = 1;' }]
+  }, '', { requireStructuredReviewContext: false });
 
-    assert.equal(validation.structured_review, undefined);
-  } finally {
-    config.requireStructuredReviewContext = previous;
-  }
+  assert.equal(validation.structured_review, undefined);
 });
 
 test('enforced structured review context rejects raw-only and incomplete requests', () => {
-  const previous = config.requireStructuredReviewContext;
-  config.requireStructuredReviewContext = true;
-  try {
-    assert.throws(
-      () => validateCouncilContext({
-        files: [{ path: 'virtual.ts', content: 'export const value = 1;' }]
-      }),
-      /Structured review context is required/
-    );
+  const options = { requireStructuredReviewContext: true };
+  assert.throws(
+    () => validateCouncilContext({
+      files: [{ path: 'virtual.ts', content: 'export const value = 1;' }]
+    }, '', options),
+    /Structured review context is required/
+  );
 
-    assert.throws(
-      () => validateCouncilContext({
-        files: [{ path: 'virtual.ts', content: 'export const value = 1;' }],
-        structured_review: {
-          ...structuredReviewContext(),
-          omitted_material: ''
-        }
-      }),
-      /omitted_material/
-    );
-  } finally {
-    config.requireStructuredReviewContext = previous;
-  }
+  assert.throws(
+    () => validateCouncilContext({
+      files: [{ path: 'virtual.ts', content: 'export const value = 1;' }],
+      structured_review: {
+        ...structuredReviewContext(),
+        omitted_material: ''
+      }
+    }, '', options),
+    /omitted_material/
+  );
 });
 
 test('enforced structured review context preserves validated fields', () => {
-  const previous = config.requireStructuredReviewContext;
-  config.requireStructuredReviewContext = true;
-  try {
-    const structured = structuredReviewContext();
-    const validation = validateCouncilContext({
-      files: [{ path: 'virtual.ts', content: 'export const value = 1;' }],
-      structured_review: structured
-    });
+  const structured = structuredReviewContext();
+  const validation = validateCouncilContext({
+    files: [{ path: 'virtual.ts', content: 'export const value = 1;' }],
+    structured_review: structured
+  }, '', { requireStructuredReviewContext: true });
 
-    assert.deepEqual(validation.structured_review, structured);
-  } finally {
-    config.requireStructuredReviewContext = previous;
-  }
+  assert.deepEqual(validation.structured_review, structured);
 });

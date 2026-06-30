@@ -202,10 +202,14 @@ export function assertSafeContextPath(normalizedPath: string): void {
   }
 }
 
-function validateStructuredReviewContext(context: CouncilContext, warnings: string[]): CouncilStructuredReviewContext | undefined {
+function validateStructuredReviewContext(
+  context: CouncilContext,
+  warnings: string[],
+  requireStructuredReviewContext: boolean
+): CouncilStructuredReviewContext | undefined {
   const structured = context.structured_review;
   if (!structured) {
-    if (config.requireStructuredReviewContext) {
+    if (requireStructuredReviewContext) {
       throw new Error('Structured review context is required when REQUIRE_STRUCTURED_REVIEW_CONTEXT=true.');
     }
     return undefined;
@@ -228,7 +232,7 @@ function validateStructuredReviewContext(context: CouncilContext, warnings: stri
     });
   }
 
-  if (!config.requireStructuredReviewContext) {
+  if (!requireStructuredReviewContext) {
     warnings.push('Structured review context was provided but is not currently required by server configuration.');
   }
 
@@ -421,6 +425,8 @@ export function validateCouncilRequestText(question: string, constraints?: strin
 
 export function validateCouncilContext(context: CouncilContext, question = '', options?: CouncilContextValidationOptions): ValidatedCouncilContext {
   const workspaceRoot = validationWorkspaceRoot(options);
+  const requireStructuredReviewContext = options?.requireStructuredReviewContext
+    ?? config.requireStructuredReviewContext;
   if (!context || typeof context !== 'object' || !Array.isArray(context.files)) {
     throw new Error('Context must include a files array.');
   }
@@ -434,7 +440,7 @@ export function validateCouncilContext(context: CouncilContext, question = '', o
   const seen = new Set<string>();
   const contentHashes = new Map<string, string>();
   const warnings: string[] = [];
-  const structuredReview = validateStructuredReviewContext(context, warnings);
+  const structuredReview = validateStructuredReviewContext(context, warnings, requireStructuredReviewContext);
   const manifestByPath = validateEvidenceManifest(context, workspaceRoot);
   const unresolvedManifestPaths = new Set(manifestByPath.keys());
   const files: ValidatedCouncilContext['files'] = [];

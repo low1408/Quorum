@@ -70,4 +70,5 @@ export type CouncilStructuredReviewContext = {
 
 export type CouncilContextValidationOptions = {
   workspaceRoot?: string;
+  requireStructuredReviewContext?: boolean;
 };

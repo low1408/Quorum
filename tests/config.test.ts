@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import test from 'node:test';
 import {
+  createRuntimeConfig,
   normalizeCdpEndpoint,
   requireEncryptionKey,
   resolveWorkspaceRoot,
@@ -31,4 +32,24 @@ test('requires an explicit encryption key with sufficient length', () => {
 
   const key = 'a-private-session-key-that-is-long-enough';
   assert.equal(requireEncryptionKey(`  ${key}  `), key);
+});
+
+test('builds immutable runtime config from an explicit environment', () => {
+  const runtime = createRuntimeConfig({
+    COUNCIL_WORKSPACE_ROOT: '/tmp/quorum-workspace',
+    DATABASE_PATH: 'data/council.db',
+    CDP_ENDPOINT: '9222',
+    HEADLESS: 'false',
+    DISPLAY: ':0',
+    HUMAN_TYPING: 'false',
+    REQUIRE_STRUCTURED_REVIEW_CONTEXT: 'true'
+  }, 'linux');
+
+  assert.equal(runtime.rootDir, '/tmp/quorum-workspace');
+  assert.equal(runtime.databasePath, '/tmp/quorum-workspace/data/council.db');
+  assert.equal(runtime.cdpEndpoint, 'http://127.0.0.1:9222');
+  assert.equal(runtime.headless, false);
+  assert.equal(runtime.humanTyping, false);
+  assert.equal(runtime.requireStructuredReviewContext, true);
+  assert.equal(Object.isFrozen(runtime), true);
 });
