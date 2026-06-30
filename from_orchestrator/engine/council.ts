@@ -55,6 +55,10 @@ const DEFAULT_PROVIDERS = (process.env.COUNCIL_PROVIDERS || 'chatgpt,gemini,meta
   .map(provider => provider.trim())
   .filter(Boolean);
 
+// Node timers are capped at a signed 32-bit integer. This is the longest
+// practical timeout without triggering TimeoutOverflowWarning timer clamping.
+export const EFFECTIVELY_INFINITE_TIMEOUT_MS = 2_147_483_647;
+
 export function uniqueProviders(providers?: string[]): string[] {
   const selected = providers?.length ? providers : DEFAULT_PROVIDERS;
   return validateProviderList(selected.map(normalizeProviderId), 'council providers');
@@ -163,10 +167,14 @@ export function buildDirectReport(analyses: CouncilAnalysis[]): string {
   ).join('\n\n---\n\n');
 }
 
+function normalizeTimeoutMs(ms: number): number {
+  return Math.min(EFFECTIVELY_INFINITE_TIMEOUT_MS, Math.max(1_000, Math.floor(ms)));
+}
+
 export function providerTimeoutMs(request: { providerTimeoutMs?: number; maxWaitMs?: number }, providerCount: number): number {
-  if (request.providerTimeoutMs && request.providerTimeoutMs > 0) return request.providerTimeoutMs;
-  if (request.maxWaitMs && request.maxWaitMs > 0) return Math.max(1_000, request.maxWaitMs);
-  return 6 * 60 * 1000;
+  if (request.providerTimeoutMs && request.providerTimeoutMs > 0) return normalizeTimeoutMs(request.providerTimeoutMs);
+  if (request.maxWaitMs && request.maxWaitMs > 0) return normalizeTimeoutMs(request.maxWaitMs);
+  return EFFECTIVELY_INFINITE_TIMEOUT_MS;
 }
 
 export function maxConcurrency(request: { maxConcurrency?: number }): number {
@@ -226,8 +234,17 @@ export async function mapWithConcurrency<T, R>(items: T[], limit: number, mapper
 
 export function timeoutSignal(ms: number, message: string): AbortController {
   const controller = new AbortController();
-  setTimeout(() => controller.abort(createCancelledError(message)), ms).unref();
+  setTimeout(() => controller.abort(createCancelledError(message)), normalizeTimeoutMs(ms)).unref();
   return controller;
+}
+
+function councilProviderTimeouts(timeoutMs: number, timeouts?: Partial<RunnerTimeoutBudgets>): Partial<RunnerTimeoutBudgets> {
+  return {
+    firstTokenMs: timeoutMs,
+    outputStabilizationMs: timeoutMs,
+    providerExecutionMs: timeoutMs,
+    ...timeouts
+  };
 }
 
 async function runProviderWithTimeout(params: {
@@ -250,7 +267,7 @@ async function runProviderWithTimeout(params: {
     const session = pool.acquire(provider);
     const response = await runner.executeTask(prompt, session, {
       signal: controller.signal,
-      timeouts: { providerExecutionMs: timeoutMs, ...timeouts },
+      timeouts: councilProviderTimeouts(timeoutMs, timeouts),
       attemptNo
     });
     session.hasActiveThread = true;

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { getDB, initSchema } from '../from_orchestrator/db/database.ts';
-import { buildCouncilAnalysisPrompt, buildDirectReport, runCouncilConsultation } from '../from_orchestrator/engine/council.ts';
+import { buildCouncilAnalysisPrompt, buildDirectReport, EFFECTIVELY_INFINITE_TIMEOUT_MS, runCouncilConsultation } from '../from_orchestrator/engine/council.ts';
 import type { CouncilRunnerFactory } from '../from_orchestrator/engine/council.ts';
 import { DomainError, classifyFailure } from '../from_orchestrator/engine/failures.ts';
 import { validateCouncilContext } from '../from_orchestrator/mcp/contextValidation.ts';
@@ -60,6 +60,46 @@ test('buildDirectReport formats each member response under a numbered heading', 
   assert.match(report, /## Council Member 2/);
   assert.match(report, /Use a decorator pattern\./);
   assert.match(report, /---/);
+});
+
+test('runCouncilConsultation defaults provider generation waits to effectively infinite', async () => {
+  initSchema();
+  const context = validateCouncilContext({
+    files: [{ path: 'virtual.ts', content: 'export const value = 1;' }]
+  }, 'Review this file.');
+
+  const seenTimeouts: any[] = [];
+  const runnerFactory: CouncilRunnerFactory = ({ runId, taskId, provider }) => ({
+    async executeTask(prompt, _poolItem, options) {
+      seenTimeouts.push(options?.timeouts);
+      getDB().prepare(`
+        INSERT INTO Tasks (task_id, run_id, provider_name, prompt_payload, status, attempt_no)
+        VALUES (?, ?, ?, ?, 'IN_PROGRESS', ?)
+      `).run(taskId, runId, provider, prompt, options?.attemptNo ?? 1);
+
+      const response = `analysis from ${provider}`;
+      getDB().prepare(`
+        UPDATE Tasks
+        SET response_text = ?, extraction_method = 'api', status = 'COMPLETED'
+        WHERE task_id = ?
+      `).run(response, taskId);
+      return response;
+    },
+    async close() {}
+  });
+
+  await runCouncilConsultation({
+    question: 'Review this file.',
+    context,
+    providers: ['mock'],
+    maxRetries: 0,
+    runnerFactory
+  });
+
+  assert.equal(seenTimeouts.length, 1);
+  assert.equal(seenTimeouts[0].firstTokenMs, EFFECTIVELY_INFINITE_TIMEOUT_MS);
+  assert.equal(seenTimeouts[0].outputStabilizationMs, EFFECTIVELY_INFINITE_TIMEOUT_MS);
+  assert.equal(seenTimeouts[0].providerExecutionMs, EFFECTIVELY_INFINITE_TIMEOUT_MS);
 });
 
 test('analysis prompt omits optional notes, constraints, and warnings when absent', () => {
