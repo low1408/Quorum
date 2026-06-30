@@ -4,12 +4,12 @@ import type { Browser, BrowserContext, Page } from 'playwright';
 import type { BrowserAdapter } from '../adapters/base.ts';
 import { createAdapter, type ProviderRegistry } from '../adapters/registry.ts';
 import { SessionManager } from '../security/sessionManager.ts';
-import { DBService } from '../db/database.ts';
 import { config } from '../config/index.ts';
 import { splitPromptIntoChunks } from '../tools/promptChunker.ts';
 import { abortableDelay, abortableRace, createCancelledError, isAbortError, throwIfAborted } from './statuses.ts';
 import { closeSessionItem, type SessionPoolItem } from './providerSessionPool.ts';
 import { DomainError, classifyFailure } from './failures.ts';
+import { sqlitePersistence, type TaskPersistence } from './persistence.ts';
 
 // Add stealth plugin to playwright chromium extra
 const chromiumExtra = chromium;
@@ -109,6 +109,7 @@ export class OrchestrationRunner {
   private stateStartTime: number;
   private isCdpConnection: boolean = false;
   private manageRunStatus: boolean;
+  private persistence: TaskPersistence;
   private currentResources: SessionPoolItem | null = null;
   private disposed = false;
 
@@ -116,13 +117,18 @@ export class OrchestrationRunner {
     runId: string,
     taskId: string,
     providerId: string = 'chatgpt',
-    options: { manageRunStatus?: boolean; providerRegistry?: ProviderRegistry } = {}
+    options: {
+      manageRunStatus?: boolean;
+      providerRegistry?: ProviderRegistry;
+      persistence?: TaskPersistence;
+    } = {}
   ) {
     this.adapter = options.providerRegistry?.create(providerId) ?? getAdapter(providerId);
     this.runId = runId;
     this.taskId = taskId;
     this.stateStartTime = Date.now();
     this.manageRunStatus = options.manageRunStatus ?? true;
+    this.persistence = options.persistence ?? sqlitePersistence;
   }
 
   public async close(): Promise<void> {
@@ -149,7 +155,7 @@ export class OrchestrationRunner {
     
     // Log telemetry to SQLite
     try {
-      DBService.addTelemetry({
+      this.persistence.addTelemetry({
         taskId: this.taskId,
         stateFrom: this.currentState,
         stateTo: nextState,
@@ -167,14 +173,14 @@ export class OrchestrationRunner {
     markdown: string,
     extractionMethod: 'clean' | 'timeout_forced' | 'manual' | 'api'
   ): Promise<void> {
-    DBService.updateTaskResponse({
+    this.persistence.updateTaskResponse({
       taskId: this.taskId,
       responseText: markdown,
       extractionMethod,
       status: 'COMPLETED',
     });
     if (this.manageRunStatus) {
-      DBService.updateRunStatusIfNotTerminal(this.runId, 'COMPLETED');
+      this.persistence.updateRunStatusIfNotTerminal(this.runId, 'COMPLETED');
     }
   }
 
@@ -213,8 +219,8 @@ export class OrchestrationRunner {
     };
     signal?.addEventListener('abort', onAbort, { once: true });
 
-    DBService.createRun(this.runId, prompt.substring(0, 100));
-    DBService.createTask({
+    this.persistence.createRun(this.runId, prompt.substring(0, 100));
+    this.persistence.createTask({
       taskId: this.taskId,
       runId: this.runId,
       providerName: this.adapter.providerId,
@@ -230,14 +236,14 @@ export class OrchestrationRunner {
       this.transitionTo('STABILIZING');
       this.transitionTo('EXTRACTING');
       const response = `[Mock Response from ${this.adapter.providerId.toUpperCase()}] for prompt: "${prompt}"`;
-      DBService.updateTaskResponse({
+      this.persistence.updateTaskResponse({
         taskId: this.taskId,
         responseText: response,
         extractionMethod: 'api',
         status: 'COMPLETED',
       });
       if (this.manageRunStatus) {
-        DBService.updateRunStatusIfNotTerminal(this.runId, 'COMPLETED');
+        this.persistence.updateRunStatusIfNotTerminal(this.runId, 'COMPLETED');
       }
       this.transitionTo('COMPLETE');
       signal?.removeEventListener('abort', onAbort);
@@ -418,7 +424,7 @@ export class OrchestrationRunner {
       this.transitionTo('DISPATCHING');
       await withStageTimeout('submission', timeouts.submissionMs, this.adapter.dispatchPrompt(page!, prompt, options), signal);
       submissionConfirmed = true;
-      DBService.markTaskSubmissionConfirmed(this.taskId);
+      this.persistence.markTaskSubmissionConfirmed(this.taskId);
 
       if (options.pasteOnly) {
         console.log('\n============================================================');
@@ -508,9 +514,9 @@ export class OrchestrationRunner {
       const failure = classifyFailure(error, submissionConfirmed);
       (error as any).submissionConfirmed = failure.submissionConfirmed;
       (error as any).failure_code = failure.code;
-      DBService.failTaskWithClassification(this.taskId, cancelled ? 'CANCELLED' : 'FAILED', failure.code, failure.submissionConfirmed);
+      this.persistence.failTaskWithClassification(this.taskId, cancelled ? 'CANCELLED' : 'FAILED', failure.code, failure.submissionConfirmed);
       if (this.manageRunStatus) {
-        DBService.updateRunStatusIfNotTerminal(this.runId, cancelled ? 'CANCELLED' : 'FAILED');
+        this.persistence.updateRunStatusIfNotTerminal(this.runId, cancelled ? 'CANCELLED' : 'FAILED');
       }
       this.transitionTo(cancelled ? 'CANCELLED' : 'FAILED');
 
@@ -545,8 +551,8 @@ export class OrchestrationRunner {
     console.log(`Starting multi-segment run: ${this.runId}, task: ${this.taskId}, segments: ${segments.length}`);
 
     // Create DB entries with the first segment as the prompt preview
-    DBService.createRun(this.runId, segments[0]?.substring(0, 100) || '');
-    DBService.createTask({
+    this.persistence.createRun(this.runId, segments[0]?.substring(0, 100) || '');
+    this.persistence.createTask({
       taskId: this.taskId,
       runId: this.runId,
       providerName: this.adapter.providerId,
@@ -558,14 +564,14 @@ export class OrchestrationRunner {
       this.transitionTo('DISPATCHING');
       this.transitionTo('COMPLETE');
       const response = `[Mock Response from ${this.adapter.providerId.toUpperCase()}] for multi-segment prompt: "${segments.join(' | ')}"`;
-      DBService.updateTaskResponse({
+      this.persistence.updateTaskResponse({
         taskId: this.taskId,
         responseText: response,
         extractionMethod: 'api',
         status: 'COMPLETED',
       });
       if (this.manageRunStatus) {
-        DBService.updateRunStatusIfNotTerminal(this.runId, 'COMPLETED');
+        this.persistence.updateRunStatusIfNotTerminal(this.runId, 'COMPLETED');
       }
       return response;
     }
@@ -730,9 +736,9 @@ export class OrchestrationRunner {
     } catch (error: any) {
       console.error(`Multi-segment task execution failed: ${error.message}`);
       
-      DBService.updateTaskStatus(this.taskId, 'FAILED');
+      this.persistence.updateTaskStatus(this.taskId, 'FAILED');
       if (this.manageRunStatus) {
-        DBService.updateRunStatusIfNotTerminal(this.runId, 'FAILED');
+        this.persistence.updateRunStatusIfNotTerminal(this.runId, 'FAILED');
       }
       this.transitionTo('FAILED');
       

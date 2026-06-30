@@ -1,5 +1,4 @@
 import crypto from 'crypto';
-import { DBService } from '../db/database.ts';
 import { OrchestrationRunner, type RunnerTimeoutBudgets } from './runner.ts';
 import { validateCouncilRequestText, type ValidatedCouncilContext } from '../context/validation.ts';
 import { validateProviderList, normalizeProviderId } from '../adapters/registry.ts';
@@ -12,6 +11,7 @@ import {
   type ProviderTaskRunner,
   type ProviderTaskRunnerFactory
 } from './providerExecution.ts';
+import { sqlitePersistence, type TaskPersistence } from './persistence.ts';
 
 export { mapWithConcurrency } from './providerExecution.ts';
 
@@ -26,6 +26,7 @@ export type CouncilConsultationRequest = {
   maxConcurrency?: number;
   maxRetries?: number;
   runnerFactory?: CouncilRunnerFactory;
+  persistence?: TaskPersistence;
 };
 
 export type CouncilConsultationResult = {
@@ -184,8 +185,11 @@ export function maxRetries(request: { maxRetries?: number }): number {
   return 1;
 }
 
-function defaultRunnerFactory(params: { runId: string; taskId: string; provider: string }): CouncilRunner {
-  return new OrchestrationRunner(params.runId, params.taskId, params.provider, { manageRunStatus: false });
+function defaultRunnerFactory(persistence: TaskPersistence): CouncilRunnerFactory {
+  return params => new OrchestrationRunner(params.runId, params.taskId, params.provider, {
+    manageRunStatus: false,
+    persistence
+  });
 }
 
 function conciseFailureDetail(provider: string, reason: unknown): string {
@@ -202,13 +206,14 @@ export function timeoutSignal(ms: number, message: string): AbortController {
 }
 
 async function runCouncilConsultationInner(request: CouncilConsultationRequest, runId: string): Promise<CouncilConsultationResult> {
+  const persistence = request.persistence ?? sqlitePersistence;
   const providers = uniqueProviders(request.providers);
   if (providers.length === 0) {
     throw new Error('At least one council provider is required.');
   }
 
-  DBService.createRun(runId, request.question.substring(0, 100));
-  DBService.updateRunStatusIfNotTerminal(runId, 'IN_PROGRESS');
+  persistence.createRun(runId, request.question.substring(0, 100));
+  persistence.updateRunStatusIfNotTerminal(runId, 'IN_PROGRESS');
   const prompt = buildCouncilAnalysisPrompt({
     question: request.question,
     context: request.context,
@@ -219,7 +224,7 @@ async function runCouncilConsultationInner(request: CouncilConsultationRequest, 
   const perProviderTimeoutMs = providerTimeoutMs(request, providers.length);
   const concurrencyLimit = maxConcurrency(request);
   const retryLimit = maxRetries(request);
-  const runnerFactory = request.runnerFactory ?? defaultRunnerFactory;
+  const runnerFactory = request.runnerFactory ?? defaultRunnerFactory(persistence);
   const warnings = [...request.context.warnings];
 
   try {
@@ -257,14 +262,14 @@ async function runCouncilConsultationInner(request: CouncilConsultationRequest, 
     }
 
     if (analyses.length === 0) {
-      DBService.updateRunStatusIfNotTerminal(runId, 'FAILED');
+      persistence.updateRunStatusIfNotTerminal(runId, 'FAILED');
       const suffix = failedProviders.length > 0 ? ` Failures: ${failedProviders.join('; ')}.` : '';
       throw new Error(`All council members failed for run ${runId}.${suffix}`);
     }
 
     const report = buildDirectReport(analyses);
     const status = analyses.length === providers.length ? 'COMPLETED' : 'PARTIAL_SUCCESS';
-    DBService.updateRunStatusIfNotTerminal(runId, status);
+    persistence.updateRunStatusIfNotTerminal(runId, status);
 
     return {
       run_id: runId,
@@ -281,6 +286,7 @@ async function runCouncilConsultationInner(request: CouncilConsultationRequest, 
 
 export async function runCouncilConsultation(request: CouncilConsultationRequest): Promise<CouncilConsultationResult> {
   const runId = `council_run_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
+  const persistence = request.persistence ?? sqlitePersistence;
 
   try {
     validateCouncilRequestText(request.question, request.constraints);
@@ -289,12 +295,12 @@ export async function runCouncilConsultation(request: CouncilConsultationRequest
   } catch (err: any) {
     if (err?.code === 'INTERVENTION_REQUIRED') {
       err.run_id = runId;
-      DBService.updateRunStatusIfNotTerminal(runId, 'INTERVENTION_REQUIRED');
+      persistence.updateRunStatusIfNotTerminal(runId, 'INTERVENTION_REQUIRED');
     } else if (isAbortError(err)) {
       err.run_id = runId;
-      DBService.updateRunStatusIfNotTerminal(runId, 'CANCELLED');
+      persistence.updateRunStatusIfNotTerminal(runId, 'CANCELLED');
     } else {
-      DBService.updateRunStatusIfNotTerminal(runId, 'FAILED');
+      persistence.updateRunStatusIfNotTerminal(runId, 'FAILED');
     }
     throw err;
   }

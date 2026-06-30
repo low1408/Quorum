@@ -1,7 +1,6 @@
 import crypto from 'crypto';
 import path from 'node:path';
 import { z } from 'zod';
-import { DBService } from '../db/database.ts';
 import { type ValidatedCouncilContext } from '../context/types.ts';
 import { OrchestrationRunner, type RunnerTimeoutBudgets } from './runner.ts';
 import {
@@ -13,6 +12,7 @@ import {
   type CouncilRunnerFactory
 } from './council.ts';
 import { isAbortError } from './statuses.ts';
+import { sqlitePersistence, type TaskPersistence } from './persistence.ts';
 
 export type ValidationTestFramework = 'auto' | 'node:test' | 'vitest' | 'jest' | 'pytest';
 
@@ -37,6 +37,7 @@ export type MaterializeValidationTestsRequest = {
   provider_timeout_ms?: number;
   timeouts?: Partial<RunnerTimeoutBudgets>;
   runnerFactory?: CouncilRunnerFactory;
+  persistence?: TaskPersistence;
 };
 
 export type MaterializedValidationTest = {
@@ -86,8 +87,11 @@ export function selectValidationTestProvider(provider?: string): string {
   return uniqueProviders(provider ? [provider] : undefined)[0];
 }
 
-function defaultRunnerFactory(params: { runId: string; taskId: string; provider: string }) {
-  return new OrchestrationRunner(params.runId, params.taskId, params.provider, { manageRunStatus: false });
+function defaultRunnerFactory(persistence: TaskPersistence): CouncilRunnerFactory {
+  return params => new OrchestrationRunner(params.runId, params.taskId, params.provider, {
+    manageRunStatus: false,
+    persistence
+  });
 }
 
 function normalizeFindingId(finding: ValidationTestFinding, index: number): string {
@@ -350,11 +354,12 @@ export function validateMaterializedValidationTestsResponse(params: {
 }
 
 export async function runMaterializeValidationTests(request: MaterializeValidationTestsRequest): Promise<MaterializeValidationTestsResult> {
+  const persistence = request.persistence ?? sqlitePersistence;
   const provider = selectValidationTestProvider(request.provider);
   const prompt = buildMaterializeValidationTestsPrompt({ ...request, provider });
   const runId = `validation_tests_run_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
   const taskId = `validation_tests_${runId}_${provider}`;
-  const runnerFactory = request.runnerFactory ?? defaultRunnerFactory;
+  const runnerFactory = request.runnerFactory ?? defaultRunnerFactory(persistence);
   const timeoutMs = providerTimeoutMs({
     maxWaitMs: request.max_wait_ms,
     providerTimeoutMs: request.provider_timeout_ms
@@ -375,10 +380,10 @@ export async function runMaterializeValidationTests(request: MaterializeValidati
       target_test_dir: request.target_test_dir,
       provider
     });
-    DBService.updateRunStatusIfNotTerminal(runId, result.status === 'COMPLETED' ? 'COMPLETED' : 'PARTIAL_SUCCESS');
+    persistence.updateRunStatusIfNotTerminal(runId, result.status === 'COMPLETED' ? 'COMPLETED' : 'PARTIAL_SUCCESS');
     return result;
   } catch (err) {
-    DBService.updateRunStatusIfNotTerminal(runId, isAbortError(err) ? 'CANCELLED' : 'FAILED');
+    persistence.updateRunStatusIfNotTerminal(runId, isAbortError(err) ? 'CANCELLED' : 'FAILED');
     throw err;
   } finally {
     controller.abort();

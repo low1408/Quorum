@@ -1,5 +1,4 @@
 import crypto from 'crypto';
-import { DBService } from '../db/database.ts';
 import { type ValidatedCouncilContext } from '../context/types.ts';
 import {
   uniqueProviders,
@@ -16,6 +15,7 @@ import {
   runProviderWithRetry,
   type ProviderExecutionResult
 } from './providerExecution.ts';
+import { sqlitePersistence, type TaskPersistence } from './persistence.ts';
 import {
   McqSimpleDecisionSchema,
   McqCriteriaDecisionSchema,
@@ -54,6 +54,7 @@ export type McqRequest = {
   maxConcurrency?: number;
   maxRetries?: number;
   runnerFactory?: CouncilRunnerFactory;
+  persistence?: TaskPersistence;
 };
 
 export type McqMemberVote = {
@@ -326,8 +327,11 @@ export function aggregateVotes(
 
 // ── Provider Execution ──
 
-function defaultRunnerFactory(params: { runId: string; taskId: string; provider: string }) {
-  return new OrchestrationRunner(params.runId, params.taskId, params.provider, { manageRunStatus: false });
+function defaultRunnerFactory(persistence: TaskPersistence): CouncilRunnerFactory {
+  return params => new OrchestrationRunner(params.runId, params.taskId, params.provider, {
+    manageRunStatus: false,
+    persistence
+  });
 }
 
 // ── Repair Attempt via Provider ──
@@ -354,6 +358,7 @@ async function attemptRepair(params: {
 
 export async function runMcqConsultation(request: McqRequest): Promise<McqResult> {
   const runId = `mcq_run_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
+  const persistence = request.persistence ?? sqlitePersistence;
 
   // Input validation
   if (!request.question || request.question.trim().length === 0) {
@@ -380,15 +385,15 @@ export async function runMcqConsultation(request: McqRequest): Promise<McqResult
     throw new Error('At least one council provider is required.');
   }
 
-  DBService.createRun(runId, `MCQ: ${request.question.substring(0, 80)}`);
-  DBService.updateRunStatusIfNotTerminal(runId, 'IN_PROGRESS');
+  persistence.createRun(runId, `MCQ: ${request.question.substring(0, 80)}`);
+  persistence.updateRunStatusIfNotTerminal(runId, 'IN_PROGRESS');
 
   const prompt = buildMcqPrompt(request);
   const pool = new ProviderSessionPool();
   const perProviderTimeoutMs = providerTimeoutMs(request, providers.length);
   const concurrencyLimit = maxConcurrency(request);
   const retryLimit = maxRetries(request);
-  const runnerFactory = request.runnerFactory ?? defaultRunnerFactory;
+  const runnerFactory = request.runnerFactory ?? defaultRunnerFactory(persistence);
   const warnings: string[] = [];
 
   try {
@@ -484,13 +489,13 @@ export async function runMcqConsultation(request: McqRequest): Promise<McqResult
     let status: McqResult['status'];
     if (votes.length === 0) {
       status = 'ALL_FAILED';
-      DBService.updateRunStatusIfNotTerminal(runId, 'FAILED');
+      persistence.updateRunStatusIfNotTerminal(runId, 'FAILED');
     } else if (votes.length === providers.length) {
       status = 'COMPLETED';
-      DBService.updateRunStatusIfNotTerminal(runId, 'COMPLETED');
+      persistence.updateRunStatusIfNotTerminal(runId, 'COMPLETED');
     } else {
       status = 'PARTIAL_SUCCESS';
-      DBService.updateRunStatusIfNotTerminal(runId, 'PARTIAL_SUCCESS');
+      persistence.updateRunStatusIfNotTerminal(runId, 'PARTIAL_SUCCESS');
     }
 
     return {
