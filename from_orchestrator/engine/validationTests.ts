@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import path from 'node:path';
 import { z } from 'zod';
 import { DBService } from '../db/database.ts';
-import { type ValidatedCouncilContext } from '../mcp/contextValidation.ts';
+import { type ValidatedCouncilContext } from '../context/types.ts';
 import { OrchestrationRunner, type RunnerTimeoutBudgets } from './runner.ts';
 import {
   uniqueProviders,

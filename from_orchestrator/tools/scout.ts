@@ -14,7 +14,7 @@ import {
   validateCouncilRequestText,
   type CouncilContext,
   type CouncilEvidenceRole
-} from '../mcp/contextValidation.ts';
+} from '../context/validation.ts';
 
 type ScoutRole = Extract<CouncilEvidenceRole, 'core' | 'contract' | 'config' | 'test' | 'supporting'>;
 type LlmPhase = 'ranking' | 'briefing';

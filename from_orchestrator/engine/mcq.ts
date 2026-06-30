@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import { DBService } from '../db/database.ts';
-import { type ValidatedCouncilContext } from '../mcp/contextValidation.ts';
+import { type ValidatedCouncilContext } from '../context/types.ts';
 import {
   uniqueProviders,
   mapWithConcurrency,

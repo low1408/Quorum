@@ -15,6 +15,7 @@
   "include": [
     "from_orchestrator/adapters/**/*.ts",
     "from_orchestrator/config/**/*.ts",
+    "from_orchestrator/context/**/*.ts",
     "from_orchestrator/db/**/*.ts",
     "from_orchestrator/engine/council.ts",
     "from_orchestrator/engine/runner.ts",

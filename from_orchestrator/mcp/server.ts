@@ -9,7 +9,7 @@ import { runCouncilConsultation, uniqueProviders } from '../engine/council.ts';
 import { runMcqConsultation } from '../engine/mcq.ts';
 import { runMaterializeValidationTests, selectValidationTestProvider } from '../engine/validationTests.ts';
 import { discoverScoutContextWithLlm, type ScoutDiscoverContextResult } from '../tools/scout.ts';
-import { validateCouncilContext, type CouncilContext } from './contextValidation.ts';
+import { validateCouncilContext, type CouncilContext } from '../context/validation.ts';
 import { saveCouncilReportArtifact } from './reportArtifact.ts';
 import { saveMcqReportArtifact } from './mcqReportArtifact.ts';
 import { loadScoutContextArtifact, saveScoutContextArtifact, type ScoutContextArtifact } from './scoutContextArtifact.ts';

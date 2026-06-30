@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import { DBService } from '../db/database.ts';
 import { OrchestrationRunner, type RunnerTimeoutBudgets } from './runner.ts';
-import { validateCouncilRequestText, type ValidatedCouncilContext } from '../mcp/contextValidation.ts';
+import { validateCouncilRequestText, type ValidatedCouncilContext } from '../context/validation.ts';
 import { validateProviderList, normalizeProviderId } from '../adapters/registry.ts';
 import { ProviderSessionPool, type SessionPoolItem } from './providerSessionPool.ts';
 import { createCancelledError, isAbortError } from './statuses.ts';
