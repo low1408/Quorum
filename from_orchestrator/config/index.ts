@@ -38,8 +38,19 @@ export function shouldLaunchHeadless(
   return platform === 'linux' && !env.DISPLAY && !env.WAYLAND_DISPLAY;
 }
 
+export function requireEncryptionKey(value: string | undefined = process.env.ENCRYPTION_KEY): string {
+  const key = value?.trim();
+  if (!key) {
+    throw new Error('ENCRYPTION_KEY is required to read or write encrypted browser sessions.');
+  }
+  if (key.length < 32) {
+    throw new Error('ENCRYPTION_KEY must contain at least 32 characters.');
+  }
+  return key;
+}
+
 export const config = {
-  encryptionKey: process.env.ENCRYPTION_KEY || 'default_fallback_secret_key_32_chars_long',
+  encryptionKey: process.env.ENCRYPTION_KEY,
   databasePath: process.env.DATABASE_PATH ? path.resolve(rootDir, process.env.DATABASE_PATH) : path.resolve(rootDir, './orchestrator.db'),
   headless: shouldLaunchHeadless(process.env.HEADLESS),
   cdpEndpoint: normalizeCdpEndpoint(process.env.CDP_ENDPOINT),
@@ -55,8 +66,3 @@ export const config = {
   requireStructuredReviewContext: process.env.REQUIRE_STRUCTURED_REVIEW_CONTEXT === 'true',
   rootDir,
 };
-
-// Simple sanity check
-if (config.encryptionKey.length < 32) {
-  console.warn('WARNING: ENCRYPTION_KEY is shorter than 32 characters. Encryption strength might be compromised.');
-}

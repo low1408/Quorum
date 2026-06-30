@@ -1,6 +1,6 @@
 import fs from 'fs/promises';
 import path from 'path';
-import { config } from '../config/index.ts';
+import { config, requireEncryptionKey } from '../config/index.ts';
 import { encrypt, decrypt } from './encryption.ts';
 
 /**
@@ -22,7 +22,7 @@ export class SessionManager {
       await fs.access(filePath);
       const encryptedData = await fs.readFile(filePath, 'utf8');
       
-      const decryptedData = decrypt(encryptedData, config.encryptionKey);
+      const decryptedData = decrypt(encryptedData, requireEncryptionKey(config.encryptionKey));
       return JSON.parse(decryptedData);
     } catch (error: any) {
       if (error.code === 'ENOENT') {
@@ -43,7 +43,7 @@ export class SessionManager {
       await fs.mkdir(config.sessionStorageDir, { recursive: true });
 
       const plaintext = JSON.stringify(storageState);
-      const encryptedData = encrypt(plaintext, config.encryptionKey);
+      const encryptedData = encrypt(plaintext, requireEncryptionKey(config.encryptionKey));
 
       await fs.writeFile(filePath, encryptedData, 'utf8');
     } catch (error: any) {
