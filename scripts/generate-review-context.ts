@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { validateCouncilContext, type CouncilContext } from '../from_orchestrator/mcp/contextValidation.ts';
+import { validateCouncilContext, type CouncilContext } from '../from_orchestrator/context/validation.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -30,17 +30,21 @@ const requiredSections = [
 const fullImplementationFiles = [
   'from_orchestrator/mcp/server.ts',
   'from_orchestrator/engine/council.ts',
+  'from_orchestrator/engine/providerExecution.ts',
   'from_orchestrator/engine/runner.ts',
   'from_orchestrator/engine/providerSessionPool.ts',
+  'from_orchestrator/engine/persistence.ts',
   'from_orchestrator/engine/failures.ts',
   'from_orchestrator/engine/statuses.ts',
-  'from_orchestrator/mcp/contextValidation.ts',
+  'from_orchestrator/context/types.ts',
+  'from_orchestrator/context/validation.ts',
   'from_orchestrator/security/encryption.ts',
   'from_orchestrator/security/sessionManager.ts'
 ];
 
 const supportingFiles = [
   'from_orchestrator/adapters/base.ts',
+  'from_orchestrator/adapters/browserLifecycle.ts',
   'from_orchestrator/adapters/registry.ts',
   'from_orchestrator/adapters/mock.ts',
   'from_orchestrator/config/index.ts',
@@ -50,7 +54,10 @@ const supportingFiles = [
 const testFiles = [
   'tests/council.test.ts',
   'tests/runner.test.ts',
-  'tests/contextValidation.test.ts'
+  'tests/contextValidation.test.ts',
+  'tests/browserLifecycle.test.ts',
+  'tests/persistence.test.ts',
+  'tests/providerSessionPool.test.ts'
 ];
 
 function relPath(absolutePath: string): string {
@@ -129,13 +136,27 @@ function runTests(): { command: string; output: string; status: number | null } 
     env: {
       ...process.env,
       NODE_ENV: 'test',
-      DATABASE_PATH: testDbPath
-    }
+      DATABASE_PATH: testDbPath,
+      REQUIRE_STRUCTURED_REVIEW_CONTEXT: 'false',
+      ENABLE_MOCK_PROVIDER: '1',
+      COUNCIL_PROVIDERS: 'mock',
+      COUNCIL_MAX_CONCURRENCY: '2',
+      COUNCIL_MAX_RETRIES: '1',
+      COUNCIL_RETRY_BACKOFF_MS: '0',
+      HEADLESS: 'true',
+      HUMAN_TYPING: 'false'
+    },
+    maxBuffer: 8 * 1024 * 1024
   });
 
   return {
     command: 'npm test',
-    output: sanitizeText(`${result.stdout || ''}${result.stderr || ''}`).trim(),
+    output: sanitizeText([
+      result.stdout || '',
+      result.stderr || '',
+      result.error ? `spawn_error=${result.error.message}` : '',
+      result.signal ? `spawn_signal=${result.signal}` : ''
+    ].filter(Boolean).join('\n')).trim(),
     status: result.status
   };
 }
@@ -298,7 +319,8 @@ from_orchestrator/
   config/     environment parsing and default resolution
   db/         SQLite schema, repair, and persistence service
   engine/     council orchestration, runner lifecycle, retries, status helpers
-  mcp/        MCP server entry point and context validation
+  context/    council context contracts and validation
+  mcp/        MCP server entry point and transport handlers
   security/   session encryption, storage, and input simulation
   tools/      prompt splitting utilities
 tests/        node:test coverage for validation, council behavior, and runner lifecycle
@@ -365,7 +387,7 @@ ${excerptByPatterns('from_orchestrator/db/database.ts', [
 
 The decisive privacy and persistence implementation is included above in:
 
-- \`from_orchestrator/mcp/contextValidation.ts\` for secret-pattern rejection and context validation.
+- \`from_orchestrator/context/validation.ts\` for secret-pattern rejection and context validation.
 - \`from_orchestrator/security/encryption.ts\` and \`from_orchestrator/security/sessionManager.ts\` for session encryption and storage.
 - \`from_orchestrator/db/database.ts\` excerpts for schema creation and terminal-status-aware updates.
 - \`.env.example\` for redacted behaviorally relevant configuration.

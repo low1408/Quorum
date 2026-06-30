@@ -36,7 +36,7 @@ export function shouldLaunchHeadless(
   return platform === 'linux' && !env.DISPLAY && !env.WAYLAND_DISPLAY;
 }
 
-export function requireEncryptionKey(value: string | undefined = process.env.ENCRYPTION_KEY): string {
+export function requireEncryptionKey(value: string | undefined): string {
   const key = value?.trim();
   if (!key) {
     throw new Error('ENCRYPTION_KEY is required to read or write encrypted browser sessions.');
