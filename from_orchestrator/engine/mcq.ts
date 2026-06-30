@@ -3,19 +3,19 @@ import { DBService } from '../db/database.ts';
 import { type ValidatedCouncilContext } from '../context/types.ts';
 import {
   uniqueProviders,
-  mapWithConcurrency,
   providerTimeoutMs,
   maxConcurrency,
   maxRetries,
-  buildDirectReport,
-  type CouncilConsultationRequest,
-  type CouncilAnalysis,
   type CouncilRunnerFactory,
 } from './council.ts';
 import { ProviderSessionPool } from './providerSessionPool.ts';
 import { OrchestrationRunner, type RunnerTimeoutBudgets } from './runner.ts';
-import { createCancelledError } from './statuses.ts';
-import { classifyFailure, type FailureClassification } from './failures.ts';
+import {
+  mapWithConcurrency,
+  runProviderAttempt,
+  runProviderWithRetry,
+  type ProviderExecutionResult
+} from './providerExecution.ts';
 import {
   McqSimpleDecisionSchema,
   McqCriteriaDecisionSchema,
@@ -324,95 +324,10 @@ export function aggregateVotes(
   };
 }
 
-// ── Provider Execution (reuses council patterns) ──
+// ── Provider Execution ──
 
 function defaultRunnerFactory(params: { runId: string; taskId: string; provider: string }) {
   return new OrchestrationRunner(params.runId, params.taskId, params.provider, { manageRunStatus: false });
-}
-
-function timeoutSignal(ms: number, message: string): AbortController {
-  const controller = new AbortController();
-  setTimeout(() => controller.abort(createCancelledError(message)), ms).unref();
-  return controller;
-}
-
-async function delay(ms: number): Promise<void> {
-  if (ms <= 0) return;
-  await new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function retryBackoffMs(attemptNo: number): number {
-  const base = Number.parseInt(process.env.COUNCIL_RETRY_BACKOFF_MS || '', 10);
-  const backoff = Number.isFinite(base) && base >= 0 ? base : 750;
-  return backoff * attemptNo;
-}
-
-async function runMcqProviderWithTimeout(params: {
-  provider: string;
-  index: number;
-  runId: string;
-  prompt: string;
-  pool: ProviderSessionPool;
-  timeoutMs: number;
-  timeouts?: Partial<RunnerTimeoutBudgets>;
-  attemptNo: number;
-  runnerFactory: CouncilRunnerFactory;
-}): Promise<CouncilAnalysis> {
-  const { provider, index, runId, prompt, pool, timeoutMs, timeouts, attemptNo, runnerFactory } = params;
-  const taskId = `mcq_${runId}_${index + 1}_${provider}_attempt_${attemptNo}`;
-  const runner = runnerFactory({ runId, taskId, provider });
-  const controller = timeoutSignal(timeoutMs, `${provider} timed out after ${timeoutMs}ms.`);
-
-  try {
-    const session = pool.acquire(provider);
-    const response = await runner.executeTask(prompt, session, {
-      signal: controller.signal,
-      timeouts: { providerExecutionMs: timeoutMs, ...timeouts },
-      attemptNo
-    });
-    session.hasActiveThread = true;
-    session.lastUsedAt = Date.now();
-    return { provider, taskId, response };
-  } catch (err) {
-    controller.abort(createCancelledError(`${provider} failed.`));
-    await runner.close().catch(() => { });
-    await pool.invalidate(provider, err instanceof Error ? err.message : String(err)).catch(() => { });
-    throw err;
-  }
-}
-
-async function runMcqProviderWithRetry(params: {
-  provider: string;
-  index: number;
-  runId: string;
-  prompt: string;
-  pool: ProviderSessionPool;
-  timeoutMs: number;
-  timeouts?: Partial<RunnerTimeoutBudgets>;
-  maxRetries: number;
-  runnerFactory: CouncilRunnerFactory;
-  warnings: string[];
-}): Promise<CouncilAnalysis> {
-  const { maxRetries: maxRetryCount, warnings, ...base } = params;
-  let lastFailure: FailureClassification | null = null;
-
-  for (let attemptNo = 1; attemptNo <= maxRetryCount + 1; attemptNo++) {
-    try {
-      return await runMcqProviderWithTimeout({ ...base, attemptNo });
-    } catch (err) {
-      const failure = classifyFailure(err);
-      lastFailure = failure;
-      warnings.push(`${base.provider} attempt ${attemptNo} failed with ${failure.code}: ${failure.publicMessage}`);
-
-      if (!failure.retryable || attemptNo > maxRetryCount) {
-        throw err;
-      }
-
-      await delay(retryBackoffMs(attemptNo));
-    }
-  }
-
-  throw new Error(lastFailure?.message || `${base.provider} failed after retries.`);
 }
 
 // ── Repair Attempt via Provider ──
@@ -426,10 +341,11 @@ async function attemptRepair(params: {
   timeoutMs: number;
   timeouts?: Partial<RunnerTimeoutBudgets>;
   runnerFactory: CouncilRunnerFactory;
-}): Promise<CouncilAnalysis> {
-  return await runMcqProviderWithTimeout({
+}): Promise<ProviderExecutionResult> {
+  return await runProviderAttempt({
     ...params,
     prompt: params.repairPrompt,
+    taskPrefix: 'mcq_repair',
     attemptNo: 1
   });
 }
@@ -477,12 +393,13 @@ export async function runMcqConsultation(request: McqRequest): Promise<McqResult
 
   try {
     // Execute all providers in parallel
-    const rawResults = await mapWithConcurrency(providers, concurrencyLimit, async (provider, index): Promise<CouncilAnalysis> => {
-      return await runMcqProviderWithRetry({
+    const rawResults = await mapWithConcurrency(providers, concurrencyLimit, async (provider, index): Promise<ProviderExecutionResult> => {
+      return await runProviderWithRetry({
         provider,
         index,
         runId,
         prompt,
+        taskPrefix: 'mcq',
         pool,
         timeoutMs: perProviderTimeoutMs,
         timeouts: request.timeouts,
