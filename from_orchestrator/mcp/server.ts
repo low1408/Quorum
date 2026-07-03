@@ -407,7 +407,7 @@ export async function handleConsultCouncil(args: any): Promise<ToolResponse> {
       contextDigest
     });
 
-    const artifact = await saveCouncilReportArtifact(result).catch((err) => {
+    const artifact = await saveCouncilReportArtifact(result, { workspaceRoot }).catch((err) => {
       console.error('[WARN] Failed to save council report artifact:', err?.message ?? err);
       return null;
     });

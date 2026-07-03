@@ -1,6 +1,5 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import type { CouncilConsultationResult } from '../engine/council.ts';
 
 export type CouncilReportArtifact = {
@@ -9,7 +8,9 @@ export type CouncilReportArtifact = {
   memberPaths: { provider: string; absolutePath: string; relativePath: string }[];
 };
 
-const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+export type SaveCouncilReportArtifactOptions = {
+  workspaceRoot?: string;
+};
 
 function safeProvider(provider: string): string {
   return provider.replace(/[^a-zA-Z0-9_-]/g, '_').toLowerCase();
@@ -52,23 +53,27 @@ function buildCouncilReportMarkdown(result: CouncilConsultationResult): string {
   ].join('\n');
 }
 
-export async function saveCouncilReportArtifact(result: CouncilConsultationResult): Promise<CouncilReportArtifact> {
-  const outputFolder = 'quorum';
-  const absoluteOutputFolder = path.resolve(repositoryRoot, outputFolder);
+export async function saveCouncilReportArtifact(
+  result: CouncilConsultationResult,
+  options: SaveCouncilReportArtifactOptions = {}
+): Promise<CouncilReportArtifact> {
+  const workspaceRoot = path.resolve(options.workspaceRoot ?? process.cwd());
+  const outputFolder = path.join('quorum', safeRunId(result.run_id));
+  const absoluteOutputFolder = path.resolve(workspaceRoot, outputFolder);
 
   await fs.mkdir(absoluteOutputFolder, { recursive: true });
 
   // Save the combined council report
   const reportRelativePath = path.join(outputFolder, 'council_report.md');
-  const reportAbsolutePath = path.resolve(repositoryRoot, reportRelativePath);
+  const reportAbsolutePath = path.resolve(workspaceRoot, reportRelativePath);
   await fs.writeFile(reportAbsolutePath, buildCouncilReportMarkdown(result), 'utf8');
 
   // Save individual member responses, one file per provider
   const memberPaths: CouncilReportArtifact['memberPaths'] = [];
   for (const analysis of result.analyses ?? []) {
-    const memberFileName = `${safeProvider(analysis.provider)}_${safeRunId(result.run_id)}.md`;
+    const memberFileName = `${safeProvider(analysis.provider)}.md`;
     const memberRelativePath = path.join(outputFolder, memberFileName);
-    const memberAbsolutePath = path.resolve(repositoryRoot, memberRelativePath);
+    const memberAbsolutePath = path.resolve(workspaceRoot, memberRelativePath);
     await fs.writeFile(
       memberAbsolutePath,
       buildMemberMarkdown(analysis.provider, analysis.response, result.run_id),

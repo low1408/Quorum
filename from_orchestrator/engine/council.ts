@@ -165,14 +165,14 @@ export function buildDirectReport(analyses: CouncilAnalysis[]): string {
   ).join('\n\n---\n\n');
 }
 
-function normalizeTimeoutMs(ms: number): number {
-  return Math.min(EFFECTIVELY_INFINITE_TIMEOUT_MS, Math.max(1_000, Math.floor(ms)));
+function normalizeTimeoutMs(ms: number, minimumMs = 1_000): number {
+  return Math.min(EFFECTIVELY_INFINITE_TIMEOUT_MS, Math.max(minimumMs, Math.floor(ms)));
 }
 
-export function providerTimeoutMs(request: { providerTimeoutMs?: number; maxWaitMs?: number }, providerCount: number): number {
-  if (request.providerTimeoutMs && request.providerTimeoutMs > 0) return normalizeTimeoutMs(request.providerTimeoutMs);
-  if (request.maxWaitMs && request.maxWaitMs > 0) return normalizeTimeoutMs(request.maxWaitMs);
-  return EFFECTIVELY_INFINITE_TIMEOUT_MS;
+export function providerTimeoutMs(request: { providerTimeoutMs?: number; maxWaitMs?: number }, providerCount: number, minimumMs = 1_000): number {
+  if (request.providerTimeoutMs && request.providerTimeoutMs > 0) return normalizeTimeoutMs(request.providerTimeoutMs, minimumMs);
+  if (request.maxWaitMs && request.maxWaitMs > 0) return normalizeTimeoutMs(request.maxWaitMs, minimumMs);
+  return normalizeTimeoutMs(EFFECTIVELY_INFINITE_TIMEOUT_MS, minimumMs);
 }
 
 export function maxConcurrency(request: { maxConcurrency?: number }): number {
@@ -223,7 +223,7 @@ async function runCouncilConsultationInner(request: CouncilConsultationRequest, 
   });
 
   const pool = new ProviderSessionPool();
-  const perProviderTimeoutMs = providerTimeoutMs(request, providers.length);
+  const perProviderTimeoutMs = providerTimeoutMs(request, providers.length, EFFECTIVELY_INFINITE_TIMEOUT_MS);
   const concurrencyLimit = maxConcurrency(request);
   const retryLimit = maxRetries(request);
   const runnerFactory = request.runnerFactory ?? defaultRunnerFactory(persistence);
