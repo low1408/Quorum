@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { saveCouncilReportArtifact } from '../from_orchestrator/mcp/reportArtifact.ts';
+import { saveCouncilReportArtifact, saveSynergizedCouncilReportArtifact } from '../from_orchestrator/mcp/reportArtifact.ts';
 
 async function makeWorkspace(): Promise<string> {
   return await fs.mkdtemp(path.join(os.tmpdir(), 'quorum-report-artifact-'));
@@ -83,6 +83,54 @@ test('saveCouncilReportArtifact uses explicit workspace root when provided', asy
 
     const markdown = await fs.readFile(artifact.absolutePath, 'utf8');
     assert.match(markdown, /No members responded\./);
+  } finally {
+    process.chdir(originalCwd);
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+});
+
+test('saveSynergizedCouncilReportArtifact writes synthesized report, members, and synthesizer output', async () => {
+  const workspaceRoot = await makeWorkspace();
+  const originalCwd = process.cwd();
+  const runId = 'synergize_run_test:unsafe/id';
+  const safeRunId = 'synergize_run_test_unsafe_id';
+
+  try {
+    process.chdir(workspaceRoot);
+
+    const artifact = await saveSynergizedCouncilReportArtifact({
+      run_id: runId,
+      status: 'COMPLETED',
+      report: '## Synergized Answer\n\nUse the best code and explanation.',
+      warnings: ['context was truncated'],
+      analyses: [
+        { provider: 'test-chatgpt', taskId: 'task_1', response: 'ChatGPT says: best explanation.' },
+        { provider: 'test-gemini', taskId: 'task_2', response: 'Gemini says: best code.' }
+      ],
+      synthesis: {
+        provider: 'test-chatgpt',
+        taskId: 'synergize_task_1',
+        response: '## Synergized Answer\n\nUse both.'
+      }
+    });
+
+    assert.equal(artifact.relativePath, `quorum/${safeRunId}/synergized_report.md`);
+    assert.equal(artifact.absolutePath, path.join(workspaceRoot, 'quorum', safeRunId, 'synergized_report.md'));
+    assert.equal(artifact.memberPaths.length, 2);
+    assert.equal(artifact.synthesisPath.relativePath, `quorum/${safeRunId}/synthesizer-test-chatgpt.md`);
+
+    const markdown = await fs.readFile(artifact.absolutePath, 'utf8');
+    assert.match(markdown, /^# Synergized Council Report/);
+    assert.match(markdown, /Synthesizer: test-chatgpt/);
+    assert.match(markdown, /Use the best code and explanation/);
+    assert.match(markdown, /- context was truncated/);
+
+    const memberMd = await fs.readFile(artifact.memberPaths[1].absolutePath, 'utf8');
+    assert.match(memberMd, /Gemini says: best code/);
+
+    const synthesisMd = await fs.readFile(artifact.synthesisPath.absolutePath, 'utf8');
+    assert.match(synthesisMd, /# Synthesizer Report — test-chatgpt/);
+    assert.match(synthesisMd, /Task ID: synergize_task_1/);
   } finally {
     process.chdir(originalCwd);
     await fs.rm(workspaceRoot, { recursive: true, force: true });

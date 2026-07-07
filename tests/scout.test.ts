@@ -126,6 +126,35 @@ test('scout_discover_context adds nearby tests for implementation queries', () =
   assert.ok(selected.includes('tsconfig.json'));
 });
 
+test('scout_discover_context redacts sensitive-looking content instead of dropping selected files', () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'quorum-scout-redaction-'));
+  fs.writeFileSync(
+    path.join(repoRoot, 'README.md'),
+    [
+      '# Dashboard',
+      '',
+      'Use DATABASE_PASSWORD=supersecretvalue123456 for local mock setup only.',
+      'The dashboard setup notes are otherwise useful council context.'
+    ].join('\n')
+  );
+
+  const result = discoverScoutContext({
+    query: 'Review README.md dashboard setup',
+    repo_root: repoRoot,
+    entrypoints: ['README.md'],
+    include_reverse_importers: false,
+    include_tests: false
+  });
+
+  const readme = result.context.files.find(file => file.path === 'README.md');
+  assert.ok(readme);
+  assert.match(readme.content, /DATABASE_PASSWORD=\[REDACTED_SECRET\]/);
+  assert.doesNotMatch(readme.content, /supersecretvalue123456/);
+  assert.match(readme.relevance || '', /redacted 1 sensitive-looking value/);
+  assert.match(result.context.notes || '', /sensitive-looking content was redacted in: README\.md/);
+  assert.match(result.context_digest, /^[a-f0-9]{64}$/);
+});
+
 test('scout_discover_context async wrapper remains deterministic unless LLM is requested', async () => {
   const calls: string[] = [];
   const result = await discoverScoutContextWithLlm({

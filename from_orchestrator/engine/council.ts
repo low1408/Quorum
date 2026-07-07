@@ -29,12 +29,21 @@ export type CouncilConsultationRequest = {
   persistence?: TaskPersistence;
 };
 
+export type SynergizedCouncilRequest = CouncilConsultationRequest & {
+  synthesizerProvider?: string;
+  synthesisConstraints?: string;
+};
+
 export type CouncilConsultationResult = {
   run_id: string;
   status: 'COMPLETED' | 'PARTIAL_SUCCESS';
   report: string;
   warnings: string[];
   analyses: CouncilAnalysis[];
+};
+
+export type SynergizedCouncilResult = CouncilConsultationResult & {
+  synthesis: CouncilAnalysis;
 };
 
 export type CouncilAnalysis = {
@@ -60,6 +69,27 @@ export const EFFECTIVELY_INFINITE_TIMEOUT_MS = 2_147_483_647;
 export function uniqueProviders(providers?: string[]): string[] {
   const selected = providers?.length ? providers : defaultCouncilProviders();
   return validateProviderList(selected.map(normalizeProviderId), 'council providers');
+}
+
+export function defaultSynergizerProvider(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const provider = env.SYNERGIZER_PROVIDER?.trim();
+  return provider || undefined;
+}
+
+export function resolveSynergizerProvider(params: {
+  explicitProvider?: string;
+  successfulAnalyses: CouncilAnalysis[];
+  env?: NodeJS.ProcessEnv;
+}): string {
+  const selected = params.explicitProvider?.trim()
+    || defaultSynergizerProvider(params.env)
+    || params.successfulAnalyses[0]?.provider;
+
+  if (!selected) {
+    throw new Error('A synthesizer provider is required when no council member succeeded.');
+  }
+
+  return validateProviderList([normalizeProviderId(selected)], 'synthesizer provider')[0];
 }
 
 export function createFreshProviderSession(source?: SessionPoolItem): SessionPoolItem {
@@ -165,6 +195,42 @@ export function buildDirectReport(analyses: CouncilAnalysis[]): string {
   ).join('\n\n---\n\n');
 }
 
+export function buildCouncilSynthesisPrompt(params: {
+  question: string;
+  analyses: CouncilAnalysis[];
+  warnings: string[];
+  constraints?: string;
+  synthesisConstraints?: string;
+}): string {
+  const warnings = renderContextWarnings(params.warnings);
+  const memberOutputs = params.analyses.map((analysis, index) => [
+    `<<<COUNCIL MEMBER ${index + 1}`,
+    `provider=${analysis.provider}`,
+    `task_id=${analysis.taskId}`,
+    '>>>',
+    analysis.response.trim(),
+    `<<<END COUNCIL MEMBER ${index + 1}>>>`
+  ].join('\n')).join('\n\n');
+
+  return [
+    'You are the synthesizer for a private multi-model council.',
+    'Your job is to produce the best final answer by combining the strongest supported parts of each council member response.',
+    'Do not average weak answers. Prefer the clearest explanation, best code, most concrete risks, and strongest tests from any member.',
+    'Reject or qualify claims that are unsupported, contradictory, vague, or outside the supplied evidence.',
+    'Write concise Markdown with exactly these top-level sections:',
+    '## Synergized Answer',
+    '## Best Contributions Used',
+    '## Conflicts / Rejected Claims',
+    '## Validation or Follow-up Tests',
+    '',
+    `QUESTION:\n${params.question}`,
+    params.constraints ? `ORIGINAL CONSTRAINTS:\n${params.constraints}` : '',
+    params.synthesisConstraints ? `SYNTHESIS CONSTRAINTS:\n${params.synthesisConstraints}` : '',
+    warnings,
+    `COUNCIL MEMBER OUTPUTS:\n${memberOutputs}`
+  ].filter(Boolean).join('\n\n');
+}
+
 function normalizeTimeoutMs(ms: number, minimumMs = 1_000): number {
   return Math.min(EFFECTIVELY_INFINITE_TIMEOUT_MS, Math.max(minimumMs, Math.floor(ms)));
 }
@@ -207,7 +273,19 @@ export function timeoutSignal(ms: number, message: string): AbortController {
   return controller;
 }
 
-async function runCouncilConsultationInner(request: CouncilConsultationRequest, runId: string): Promise<CouncilConsultationResult> {
+type CouncilMemberCollection = {
+  run_id: string;
+  status: 'COMPLETED' | 'PARTIAL_SUCCESS';
+  warnings: string[];
+  analyses: CouncilAnalysis[];
+  providers: string[];
+  pool: ProviderSessionPool;
+  perProviderTimeoutMs: number;
+  runnerFactory: CouncilRunnerFactory;
+  persistence: TaskPersistence;
+};
+
+async function collectCouncilAnalyses(request: CouncilConsultationRequest, runId: string): Promise<CouncilMemberCollection> {
   const persistence = request.persistence ?? sqlitePersistence;
   const providers = uniqueProviders(request.providers);
   if (providers.length === 0) {
@@ -269,20 +347,103 @@ async function runCouncilConsultationInner(request: CouncilConsultationRequest, 
       throw new Error(`All council members failed for run ${runId}.${suffix}`);
     }
 
-    const report = buildDirectReport(analyses);
     const status = analyses.length === providers.length ? 'COMPLETED' : 'PARTIAL_SUCCESS';
-    persistence.updateRunStatusIfNotTerminal(runId, status);
 
     return {
       run_id: runId,
       status,
-      report,
       warnings: Array.from(new Set(warnings)),
-      analyses
+      analyses,
+      providers,
+      pool,
+      perProviderTimeoutMs,
+      runnerFactory,
+      persistence
+    };
+  } catch (err: any) {
+    err.run_id = runId;
+    err.successfulProviderCount ??= 0;
+    err.failedProviderCount ??= providers.length;
+    throw err;
+  }
+}
+
+async function runCouncilConsultationInner(request: CouncilConsultationRequest, runId: string): Promise<CouncilConsultationResult> {
+  const collection = await collectCouncilAnalyses(request, runId);
+
+  try {
+    const report = buildDirectReport(collection.analyses);
+    collection.persistence.updateRunStatusIfNotTerminal(runId, collection.status);
+
+    return {
+      run_id: runId,
+      status: collection.status,
+      report,
+      warnings: collection.warnings,
+      analyses: collection.analyses
     };
   } finally {
     // Keep browser sessions open after council consultation finished as requested by the user
     console.log('\n[INFO] Keeping active browser sessions open for visual inspection.\n');
+  }
+}
+
+async function runSynergizedCouncilConsultationInner(request: SynergizedCouncilRequest, runId: string): Promise<SynergizedCouncilResult> {
+  const collection = await collectCouncilAnalyses(request, runId);
+
+  try {
+    const synthesizerProvider = resolveSynergizerProvider({
+      explicitProvider: request.synthesizerProvider,
+      successfulAnalyses: collection.analyses
+    });
+    const prompt = buildCouncilSynthesisPrompt({
+      question: request.question,
+      constraints: request.constraints,
+      synthesisConstraints: request.synthesisConstraints,
+      warnings: collection.warnings,
+      analyses: collection.analyses
+    });
+    const synthesisPool = new ProviderSessionPool();
+    synthesisPool.set(
+      synthesizerProvider,
+      createFreshProviderSession(collection.pool.get(synthesizerProvider))
+    );
+    const synthesis = await runProviderWithRetry({
+      provider: synthesizerProvider,
+      index: collection.providers.length,
+      runId,
+      prompt,
+      taskPrefix: 'synergize',
+      pool: synthesisPool,
+      timeoutMs: collection.perProviderTimeoutMs,
+      timeoutDefaults: {
+        firstTokenMs: collection.perProviderTimeoutMs,
+        outputStabilizationMs: collection.perProviderTimeoutMs
+      },
+      timeouts: request.timeouts,
+      maxRetries: maxRetries(request),
+      runnerFactory: collection.runnerFactory,
+      warnings: collection.warnings
+    });
+
+    collection.persistence.updateRunStatusIfNotTerminal(runId, collection.status);
+
+    return {
+      run_id: runId,
+      status: collection.status,
+      report: synthesis.response,
+      warnings: Array.from(new Set(collection.warnings)),
+      analyses: collection.analyses,
+      synthesis
+    };
+  } catch (err: any) {
+    err.run_id = runId;
+    err.successfulProviderCount = collection.analyses.length;
+    err.failedProviderCount = Math.max(0, collection.providers.length - collection.analyses.length) + 1;
+    collection.persistence.updateRunStatusIfNotTerminal(runId, 'FAILED');
+    throw err;
+  } finally {
+    console.log('\n[INFO] Synergize: Keeping active browser sessions open for visual inspection.\n');
   }
 }
 
@@ -294,6 +455,33 @@ export async function runCouncilConsultation(request: CouncilConsultationRequest
     validateCouncilRequestText(request.question, request.constraints);
     uniqueProviders(request.providers);
     return await runCouncilConsultationInner(request, runId);
+  } catch (err: any) {
+    if (err?.code === 'INTERVENTION_REQUIRED') {
+      err.run_id = runId;
+      persistence.updateRunStatusIfNotTerminal(runId, 'INTERVENTION_REQUIRED');
+    } else if (isAbortError(err)) {
+      err.run_id = runId;
+      persistence.updateRunStatusIfNotTerminal(runId, 'CANCELLED');
+    } else {
+      persistence.updateRunStatusIfNotTerminal(runId, 'FAILED');
+    }
+    throw err;
+  }
+}
+
+export async function runSynergizedCouncilConsultation(request: SynergizedCouncilRequest): Promise<SynergizedCouncilResult> {
+  const runId = `synergize_run_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
+  const persistence = request.persistence ?? sqlitePersistence;
+
+  try {
+    const combinedConstraints = [request.constraints, request.synthesisConstraints].filter(Boolean).join('\n\n') || undefined;
+    validateCouncilRequestText(request.question, combinedConstraints);
+    uniqueProviders(request.providers);
+    const configuredSynthesizer = request.synthesizerProvider || defaultSynergizerProvider();
+    if (configuredSynthesizer) {
+      validateProviderList([normalizeProviderId(configuredSynthesizer)], 'synthesizer provider');
+    }
+    return await runSynergizedCouncilConsultationInner(request, runId);
   } catch (err: any) {
     if (err?.code === 'INTERVENTION_REQUIRED') {
       err.run_id = runId;

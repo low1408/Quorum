@@ -1,11 +1,15 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import type { CouncilConsultationResult } from '../engine/council.ts';
+import type { CouncilConsultationResult, SynergizedCouncilResult } from '../engine/council.ts';
 
 export type CouncilReportArtifact = {
   absolutePath: string;
   relativePath: string;
   memberPaths: { provider: string; absolutePath: string; relativePath: string }[];
+};
+
+export type SynergizedCouncilReportArtifact = CouncilReportArtifact & {
+  synthesisPath: { provider: string; absolutePath: string; relativePath: string };
 };
 
 export type SaveCouncilReportArtifactOptions = {
@@ -90,5 +94,87 @@ export async function saveCouncilReportArtifact(
     absolutePath: reportAbsolutePath,
     relativePath: reportRelativePath,
     memberPaths
+  };
+}
+
+function buildSynergizedReportMarkdown(result: SynergizedCouncilResult): string {
+  const warnings = result.warnings.length > 0
+    ? result.warnings.map(warning => `- ${warning}`).join('\n')
+    : '- None';
+
+  return [
+    '# Synergized Council Report',
+    '',
+    `Run ID: ${result.run_id}`,
+    `Status: ${result.status}`,
+    `Synthesizer: ${result.synthesis.provider}`,
+    '',
+    '## Report',
+    '',
+    result.report.trim(),
+    '',
+    '## Warnings',
+    '',
+    warnings,
+    ''
+  ].join('\n');
+}
+
+function buildSynthesizerMarkdown(result: SynergizedCouncilResult): string {
+  return [
+    `# Synthesizer Report — ${result.synthesis.provider}`,
+    '',
+    `Run ID: ${result.run_id}`,
+    `Task ID: ${result.synthesis.taskId}`,
+    '',
+    result.synthesis.response.trim(),
+    ''
+  ].join('\n');
+}
+
+export async function saveSynergizedCouncilReportArtifact(
+  result: SynergizedCouncilResult,
+  options: SaveCouncilReportArtifactOptions = {}
+): Promise<SynergizedCouncilReportArtifact> {
+  const workspaceRoot = path.resolve(options.workspaceRoot ?? process.cwd());
+  const outputFolder = path.join('quorum', safeRunId(result.run_id));
+  const absoluteOutputFolder = path.resolve(workspaceRoot, outputFolder);
+
+  await fs.mkdir(absoluteOutputFolder, { recursive: true });
+
+  const reportRelativePath = path.join(outputFolder, 'synergized_report.md');
+  const reportAbsolutePath = path.resolve(workspaceRoot, reportRelativePath);
+  await fs.writeFile(reportAbsolutePath, buildSynergizedReportMarkdown(result), 'utf8');
+
+  const memberPaths: CouncilReportArtifact['memberPaths'] = [];
+  for (const analysis of result.analyses ?? []) {
+    const memberFileName = `${safeProvider(analysis.provider)}.md`;
+    const memberRelativePath = path.join(outputFolder, memberFileName);
+    const memberAbsolutePath = path.resolve(workspaceRoot, memberRelativePath);
+    await fs.writeFile(
+      memberAbsolutePath,
+      buildMemberMarkdown(analysis.provider, analysis.response, result.run_id),
+      'utf8'
+    );
+    memberPaths.push({
+      provider: analysis.provider,
+      absolutePath: memberAbsolutePath,
+      relativePath: memberRelativePath
+    });
+  }
+
+  const synthesisRelativePath = path.join(outputFolder, `synthesizer-${safeProvider(result.synthesis.provider)}.md`);
+  const synthesisAbsolutePath = path.resolve(workspaceRoot, synthesisRelativePath);
+  await fs.writeFile(synthesisAbsolutePath, buildSynthesizerMarkdown(result), 'utf8');
+
+  return {
+    absolutePath: reportAbsolutePath,
+    relativePath: reportRelativePath,
+    memberPaths,
+    synthesisPath: {
+      provider: result.synthesis.provider,
+      absolutePath: synthesisAbsolutePath,
+      relativePath: synthesisRelativePath
+    }
   };
 }

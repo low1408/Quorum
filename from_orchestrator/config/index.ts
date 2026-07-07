@@ -53,6 +53,7 @@ export type RuntimeConfig = Readonly<{
   headless: boolean;
   cdpEndpoint: string;
   evaluatorProvider: string;
+  synergizerProvider?: string;
   enableSummaryEvaluation: boolean;
   enableCouncilEvaluation: boolean;
   councilEvaluationMode: string;
@@ -76,6 +77,7 @@ export function createRuntimeConfig(
     headless: shouldLaunchHeadless(env.HEADLESS, env, platform),
     cdpEndpoint: normalizeCdpEndpoint(env.CDP_ENDPOINT),
     evaluatorProvider: env.EVALUATOR_PROVIDER || 'gemini',
+    synergizerProvider: env.SYNERGIZER_PROVIDER?.trim() || undefined,
     enableSummaryEvaluation: false,
     enableCouncilEvaluation: env.ENABLE_COUNCIL_EVALUATION !== 'false',
     councilEvaluationMode: env.COUNCIL_EVALUATION_MODE || 'inline',

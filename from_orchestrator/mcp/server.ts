@@ -5,12 +5,13 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { DBService, initSchema } from '../db/database.ts';
-import { runCouncilConsultation, uniqueProviders } from '../engine/council.ts';
+import { defaultSynergizerProvider, runCouncilConsultation, runSynergizedCouncilConsultation, uniqueProviders } from '../engine/council.ts';
+import { normalizeProviderId, validateProviderList } from '../adapters/registry.ts';
 import { runMcqConsultation } from '../engine/mcq.ts';
 import { runMaterializeValidationTests, selectValidationTestProvider } from '../engine/validationTests.ts';
 import { discoverScoutContextWithLlm, type ScoutDiscoverContextResult } from '../tools/scout.ts';
 import { validateCouncilContext, type CouncilContext } from '../context/validation.ts';
-import { saveCouncilReportArtifact } from './reportArtifact.ts';
+import { saveCouncilReportArtifact, saveSynergizedCouncilReportArtifact } from './reportArtifact.ts';
 import { saveMcqReportArtifact } from './mcqReportArtifact.ts';
 import { loadScoutContextArtifact, saveScoutContextArtifact, type ScoutContextArtifact } from './scoutContextArtifact.ts';
 
@@ -71,6 +72,12 @@ const consultCouncilSchema = {
   provider_timeout_ms: z.number().int().positive().optional(),
   max_concurrency: z.number().int().positive().optional(),
   max_retries: z.number().int().min(0).optional()
+};
+
+const consultCouncilSynergizeSchema = {
+  ...consultCouncilSchema,
+  synthesizer_provider: z.string().min(1).optional(),
+  synthesis_constraints: z.string().optional()
 };
 
 const scoutDiscoverContextSchema = {
@@ -450,6 +457,104 @@ server.registerTool(
     inputSchema: consultCouncilSchema
   },
   handleConsultCouncil
+);
+
+export async function handleConsultCouncilSynergize(args: any): Promise<ToolResponse> {
+  initSchema();
+
+  const startedAt = Date.now();
+  const toolCallId = createToolCallId('consult_council_synergize');
+  DBService.createMcpToolCallMetric({
+    toolCallId,
+    toolName: 'consult_council_synergize',
+    requestedProviderCount: rawRequestedProviderCount(args.providers) + 1
+  });
+
+  let requestedProviderCount = rawRequestedProviderCount(args.providers) + 1;
+  let contextDigest: string | null = null;
+
+  try {
+    const selectedProviders = uniqueProviders(args.providers);
+    requestedProviderCount = selectedProviders.length + 1;
+    const configuredSynthesizer = args.synthesizer_provider || defaultSynergizerProvider();
+    if (configuredSynthesizer) {
+      validateProviderList([normalizeProviderId(configuredSynthesizer)], 'synthesizer provider');
+    }
+
+    const { context, workspaceRoot } = await resolveCouncilContext(args);
+    const validatedContext = validateCouncilContext(context, args.question, { workspaceRoot });
+    contextDigest = validatedContext.context_digest;
+
+    const result = await runSynergizedCouncilConsultation({
+      question: args.question,
+      context: validatedContext,
+      constraints: args.constraints,
+      synthesisConstraints: args.synthesis_constraints,
+      synthesizerProvider: args.synthesizer_provider,
+      providers: args.providers,
+      maxWaitMs: args.max_wait_ms,
+      providerTimeoutMs: args.provider_timeout_ms,
+      maxConcurrency: args.max_concurrency,
+      maxRetries: args.max_retries,
+      runnerFactory: args.runnerFactory
+    });
+
+    DBService.completeMcpToolCallMetric({
+      toolCallId,
+      runId: result.run_id,
+      status: result.status,
+      requestedProviderCount,
+      successfulProviderCount: result.analyses.length + 1,
+      failedProviderCount: Math.max(0, requestedProviderCount - result.analyses.length - 1),
+      durationMs: Date.now() - startedAt,
+      contextDigest
+    });
+
+    const artifact = await saveSynergizedCouncilReportArtifact(result, { workspaceRoot }).catch((err) => {
+      console.error('[WARN] Failed to save synergized council report artifact:', err?.message ?? err);
+      return null;
+    });
+
+    if (artifact) {
+      const memberList = artifact.memberPaths.map(m => `  - ${m.provider}: ${m.relativePath}`).join('\n');
+      console.error(`[INFO] Synergized council run saved to ${artifact.relativePath}\n  - synthesizer ${artifact.synthesisPath.provider}: ${artifact.synthesisPath.relativePath}\n${memberList}`);
+    }
+
+    const response = artifact ? { ...result, artifact } : result;
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response, null, 2)
+        }
+      ],
+      structuredContent: response
+    };
+  } catch (err: any) {
+    DBService.failMcpToolCallMetric({
+      toolCallId,
+      runId: err?.run_id ?? null,
+      status: contextDigest ? failedMetricStatus(err) : 'VALIDATION_FAILED',
+      requestedProviderCount,
+      successfulProviderCount: err?.successfulProviderCount ?? 0,
+      failedProviderCount: err?.failedProviderCount ?? 0,
+      durationMs: Date.now() - startedAt,
+      contextDigest,
+      errorMessage: errorMessage(err)
+    });
+    throw err;
+  }
+}
+
+server.registerTool(
+  'consult_council_synergize',
+  {
+    title: 'Consult Council Synergize',
+    description: 'Run an independent LLM council, then ask one synthesizer provider to combine the best supported code, explanations, risks, and tests into one final answer with contribution provenance.',
+    inputSchema: consultCouncilSynergizeSchema
+  },
+  handleConsultCouncilSynergize
 );
 
 export async function handleScoutDiscoverContext(args: any): Promise<ToolResponse> {

@@ -1,9 +1,18 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { getDB, initSchema } from '../from_orchestrator/db/database.ts';
-import { buildCouncilAnalysisPrompt, buildDirectReport, EFFECTIVELY_INFINITE_TIMEOUT_MS, runCouncilConsultation } from '../from_orchestrator/engine/council.ts';
+import {
+  buildCouncilAnalysisPrompt,
+  buildCouncilSynthesisPrompt,
+  buildDirectReport,
+  EFFECTIVELY_INFINITE_TIMEOUT_MS,
+  resolveSynergizerProvider,
+  runCouncilConsultation,
+  runSynergizedCouncilConsultation
+} from '../from_orchestrator/engine/council.ts';
 import type { CouncilRunnerFactory } from '../from_orchestrator/engine/council.ts';
 import { DomainError, classifyFailure } from '../from_orchestrator/engine/failures.ts';
+import type { SessionPoolItem } from '../from_orchestrator/engine/providerSessionPool.ts';
 import { validateCouncilContext } from '../from_orchestrator/mcp/contextValidation.ts';
 
 test('analysis prompt requires evidence-linked findings and preserves source boundaries', () => {
@@ -60,6 +69,238 @@ test('buildDirectReport formats each member response under a numbered heading', 
   assert.match(report, /## Council Member 2/);
   assert.match(report, /Use a decorator pattern\./);
   assert.match(report, /---/);
+});
+
+test('buildCouncilSynthesisPrompt includes stable member labels and provenance requirements', () => {
+  const prompt = buildCouncilSynthesisPrompt({
+    question: 'How should this be implemented?',
+    constraints: 'Keep it small.',
+    synthesisConstraints: 'Prefer robust code and clear explanation.',
+    warnings: ['context was truncated'],
+    analyses: [
+      { provider: 'mock', taskId: 'task1', response: 'Good code sample.' },
+      { provider: 'chatgpt', taskId: 'task2', response: 'Better explanation.' }
+    ]
+  });
+
+  assert.match(prompt, /Do not average weak answers/);
+  assert.match(prompt, /## Best Contributions Used/);
+  assert.match(prompt, /## Conflicts \/ Rejected Claims/);
+  assert.match(prompt, /<<<COUNCIL MEMBER 1/);
+  assert.match(prompt, /provider=mock/);
+  assert.match(prompt, /task_id=task2/);
+  assert.match(prompt, /Good code sample/);
+  assert.match(prompt, /Better explanation/);
+  assert.match(prompt, /SYNTHESIS CONSTRAINTS:\nPrefer robust code/);
+  assert.match(prompt, /context was truncated/);
+});
+
+test('resolveSynergizerProvider honors explicit, env, then first successful provider', () => {
+  const analyses = [{ provider: 'mock', taskId: 'task1', response: 'analysis' }];
+
+  assert.equal(resolveSynergizerProvider({ explicitProvider: 'CHATGPT', successfulAnalyses: analyses, env: { SYNERGIZER_PROVIDER: 'gemini' } as any }), 'chatgpt');
+  assert.equal(resolveSynergizerProvider({ successfulAnalyses: analyses, env: { SYNERGIZER_PROVIDER: 'GEMINI' } as any }), 'gemini');
+  assert.equal(resolveSynergizerProvider({ successfulAnalyses: analyses, env: {} as any }), 'mock');
+  assert.throws(
+    () => resolveSynergizerProvider({ successfulAnalyses: analyses, env: { SYNERGIZER_PROVIDER: 'not-real' } as any }),
+    /Unsupported provider IDs: not-real/
+  );
+});
+
+test('runSynergizedCouncilConsultation synthesizes successful council outputs', async () => {
+  initSchema();
+  const context = validateCouncilContext({
+    files: [{ path: 'virtual.ts', content: 'export const value = 1;' }]
+  }, 'Review this file.');
+
+  const runnerFactory: CouncilRunnerFactory = ({ taskId, provider }) => ({
+    async executeTask() {
+      if (taskId.startsWith('synergize_')) {
+        return '## Synergized Answer\n\nUse the mock code and the chatgpt explanation.\n\n## Best Contributions Used\n\n- Council Member 1: code\n- Council Member 2: explanation\n\n## Conflicts / Rejected Claims\n\n- None\n\n## Validation or Follow-up Tests\n\n- Run npm test';
+      }
+      return `analysis from ${provider}`;
+    },
+    async close() {}
+  });
+
+  const result = await runSynergizedCouncilConsultation({
+    question: 'Review this file.',
+    context,
+    providers: ['mock', 'chatgpt'],
+    synthesizerProvider: 'mock',
+    maxRetries: 0,
+    runnerFactory
+  });
+
+  assert.equal(result.status, 'COMPLETED');
+  assert.match(result.run_id, /^synergize_run_/);
+  assert.equal(result.analyses.length, 2);
+  assert.equal(result.synthesis.provider, 'mock');
+  assert.match(result.report, /## Synergized Answer/);
+  assert.match(result.report, /chatgpt explanation/);
+});
+
+test('runSynergizedCouncilConsultation gives the synthesizer a fresh chat page', async () => {
+  initSchema();
+  const context = validateCouncilContext({
+    files: [{ path: 'virtual.ts', content: 'export const value = 1;' }]
+  }, 'Review this file.');
+
+  const fakeBrowser = { browser: true };
+  const fakeContext = { context: true };
+  const fakeCouncilPage = { page: 'council' };
+  let councilSession: SessionPoolItem | undefined;
+  let synthesisSession: SessionPoolItem | undefined;
+
+  const runnerFactory: CouncilRunnerFactory = ({ taskId }) => ({
+    async executeTask(_prompt, poolItem) {
+      assert.ok(poolItem);
+      if (taskId.startsWith('synergize_')) {
+        synthesisSession = poolItem;
+        return '## Synergized Answer\n\nUse the fresh page.';
+      }
+
+      councilSession = poolItem;
+      poolItem.browser = fakeBrowser as any;
+      poolItem.context = fakeContext as any;
+      poolItem.page = fakeCouncilPage as any;
+      poolItem.ownsBrowser = true;
+      poolItem.ownsContext = true;
+      poolItem.ownsPage = true;
+      return 'analysis from mock';
+    },
+    async close() {}
+  });
+
+  await runSynergizedCouncilConsultation({
+    question: 'Review this file.',
+    context,
+    providers: ['mock'],
+    synthesizerProvider: 'mock',
+    maxRetries: 0,
+    runnerFactory
+  });
+
+  assert.ok(councilSession);
+  assert.ok(synthesisSession);
+  assert.notEqual(synthesisSession, councilSession);
+  assert.equal(synthesisSession.browser, fakeBrowser as any);
+  assert.equal(synthesisSession.context, fakeContext as any);
+  assert.equal(synthesisSession.page, null);
+  assert.equal(synthesisSession.ownsBrowser, false);
+  assert.equal(synthesisSession.ownsContext, false);
+  assert.equal(synthesisSession.ownsPage, true);
+});
+
+test('runSynergizedCouncilConsultation returns partial success when synthesis succeeds after one council failure', async () => {
+  initSchema();
+  const context = validateCouncilContext({
+    files: [{ path: 'virtual.ts', content: 'export const value = 1;' }]
+  }, 'Review this file.');
+
+  const runnerFactory: CouncilRunnerFactory = ({ taskId, provider }) => ({
+    async executeTask() {
+      if (taskId.startsWith('synergize_')) return '## Synergized Answer\n\nUse the surviving analysis.';
+      if (provider === 'chatgpt') throw new Error('simulated provider failure');
+      return `analysis from ${provider}`;
+    },
+    async close() {}
+  });
+
+  const result = await runSynergizedCouncilConsultation({
+    question: 'Review this file.',
+    context,
+    providers: ['mock', 'chatgpt'],
+    synthesizerProvider: 'mock',
+    maxRetries: 0,
+    runnerFactory
+  });
+
+  assert.equal(result.status, 'PARTIAL_SUCCESS');
+  assert.equal(result.analyses.length, 1);
+  assert.ok(result.warnings.some(warning => warning.includes('simulated provider failure')));
+});
+
+test('runSynergizedCouncilConsultation fails when all council members fail', async () => {
+  initSchema();
+  const context = validateCouncilContext({
+    files: [{ path: 'virtual.ts', content: 'export const value = 1;' }]
+  }, 'Review this file.');
+
+  const runnerFactory: CouncilRunnerFactory = () => ({
+    async executeTask() {
+      throw new Error('all failed');
+    },
+    async close() {}
+  });
+
+  await assert.rejects(
+    runSynergizedCouncilConsultation({
+      question: 'Review this file.',
+      context,
+      providers: ['mock'],
+      synthesizerProvider: 'mock',
+      maxRetries: 0,
+      runnerFactory
+    }),
+    /All council members failed/
+  );
+});
+
+test('runSynergizedCouncilConsultation fails the run when synthesizer fails', async () => {
+  initSchema();
+  const context = validateCouncilContext({
+    files: [{ path: 'virtual.ts', content: 'export const value = 1;' }]
+  }, 'Review this file.');
+
+  const runnerFactory: CouncilRunnerFactory = ({ taskId, provider }) => ({
+    async executeTask() {
+      if (taskId.startsWith('synergize_')) throw new Error('synthesis failed');
+      return `analysis from ${provider}`;
+    },
+    async close() {}
+  });
+
+  let runId = '';
+  await assert.rejects(
+    runSynergizedCouncilConsultation({
+      question: 'Review this file.',
+      context,
+      providers: ['mock'],
+      synthesizerProvider: 'mock',
+      maxRetries: 0,
+      runnerFactory
+    }).catch(err => {
+      runId = err.run_id;
+      throw err;
+    }),
+    /synthesis failed/
+  );
+
+  const row = getDB().prepare('SELECT status FROM Runs WHERE run_id = ?').get(runId) as any;
+  assert.equal(row.status, 'FAILED');
+});
+
+test('runSynergizedCouncilConsultation rejects unsupported synthesizer before creating a run', async () => {
+  initSchema();
+  const context = validateCouncilContext({
+    files: [{ path: 'virtual.ts', content: 'export const value = 1;' }]
+  }, 'Review this file.');
+  const before = (getDB().prepare('SELECT COUNT(*) AS count FROM Runs').get() as any).count;
+
+  await assert.rejects(
+    runSynergizedCouncilConsultation({
+      question: 'Review this file.',
+      context,
+      providers: ['mock'],
+      synthesizerProvider: 'not-real',
+      maxRetries: 0
+    }),
+    /Unsupported provider IDs: not-real/
+  );
+
+  const after = (getDB().prepare('SELECT COUNT(*) AS count FROM Runs').get() as any).count;
+  assert.equal(after, before);
 });
 
 test('runCouncilConsultation defaults provider generation waits to effectively infinite', async () => {

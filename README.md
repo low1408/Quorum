@@ -107,6 +107,8 @@ npm run review-context:test
 
 Expected behavior: council requests are validated, executed through configured providers, persisted to the local database, and saved as Markdown report artifacts.
 
+Use `consult_council_synergize` when you want the council to produce independent member outputs first, then have one synthesizer provider combine the strongest code, explanations, risks, and tests into a final Markdown answer with contribution provenance. Set `SYNERGIZER_PROVIDER` or pass `synthesizer_provider`; otherwise the first successful council provider synthesizes.
+
 Manual Scout LLM verification:
 
 1. Start the MCP server with `npm run mcp:start`.

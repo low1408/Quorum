@@ -40,8 +40,29 @@ const STRUCTURED_REVIEW_FIELDS: Array<keyof CouncilStructuredReviewContext> = [
 const SECRET_PATTERNS = [
   /-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----/,
   /\b(?:sk|pk|rk|xox[baprs])-[-A-Za-z0-9_]{20,}\b/,
-  /\b(?:api[_-]?key|secret|token|password|passwd|credential)\b\s*[:=]\s*["']?[A-Za-z0-9_./+=-]{16,}/i,
+  /\b[A-Za-z0-9_-]*(?:api[_-]?key|secret|token|password|passwd|credential)[A-Za-z0-9_-]*\b\s*[:=]\s*["']?[A-Za-z0-9_./+=-]{16,}/i,
   /\bAWS_SECRET_ACCESS_KEY\b\s*[:=]\s*["']?[A-Za-z0-9/+=]{30,}/i
+];
+const SECRET_REDACTION_PATTERNS: Array<{
+  pattern: RegExp;
+  replace: string | ((match: string, ...captures: string[]) => string);
+}> = [
+  {
+    pattern: /-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----/g,
+    replace: '[REDACTED_SECRET:PRIVATE_KEY]'
+  },
+  {
+    pattern: /\b(?:sk|pk|rk|xox[baprs])-[-A-Za-z0-9_]{20,}\b/g,
+    replace: '[REDACTED_SECRET:TOKEN]'
+  },
+  {
+    pattern: /\b([A-Za-z0-9_-]*(?:api[_-]?key|secret|token|password|passwd|credential)[A-Za-z0-9_-]*\b\s*[:=]\s*["']?)[A-Za-z0-9_./+=-]{16,}/gi,
+    replace: (_match, prefix) => `${prefix}[REDACTED_SECRET]`
+  },
+  {
+    pattern: /\b(AWS_SECRET_ACCESS_KEY\b\s*[:=]\s*["']?)[A-Za-z0-9/+=]{30,}/gi,
+    replace: (_match, prefix) => `${prefix}[REDACTED_SECRET]`
+  }
 ];
 const CONTEXT_KEYS = new Set(['schema_version', 'files', 'notes', 'evidence_manifest', 'structured_review']);
 const CONTEXT_FILE_KEYS = new Set([
@@ -120,6 +141,23 @@ function sha256(content: string): string {
 
 function hasSecretMaterial(content: string): boolean {
   return SECRET_PATTERNS.some(pattern => pattern.test(content));
+}
+
+export function redactSecretMaterial(content: string): { content: string; redactionCount: number } {
+  let redacted = content;
+  let redactionCount = 0;
+
+  for (const { pattern, replace } of SECRET_REDACTION_PATTERNS) {
+    redacted = redacted.replace(pattern, (...args: string[]) => {
+      redactionCount++;
+      if (typeof replace === 'string') return replace;
+      const match = args[0];
+      const captures = args.slice(1, -2);
+      return replace(match, ...captures);
+    });
+  }
+
+  return { content: redacted, redactionCount };
 }
 
 function assertNoUnknownKeys(value: Record<string, unknown>, allowed: Set<string>, label: string): void {
@@ -504,7 +542,8 @@ export function validateCouncilContext(context: CouncilContext, question = '', o
     if (!absolutePath.startsWith(workspaceRoot + path.sep) && absolutePath !== workspaceRoot) {
       throw new Error(`Context file path escapes the workspace: ${normalizedPath}`);
     }
-    if (fs.existsSync(absolutePath)) {
+    const provenance = manifestItem?.provenance || 'repository';
+    if (provenance === 'repository' && fs.existsSync(absolutePath)) {
       const diskHash = sha256(fs.readFileSync(absolutePath, 'utf8'));
       if (file.sha256 && diskHash !== file.sha256.toLowerCase()) {
         throw new Error(`Context file is stale relative to disk: ${normalizedPath}`);
@@ -516,7 +555,7 @@ export function validateCouncilContext(context: CouncilContext, question = '', o
           warnings.push(`Context file may be stale relative to disk mtime: ${normalizedPath}.`);
         }
       }
-    } else {
+    } else if (!fs.existsSync(absolutePath)) {
       warnings.push(`Context file does not exist on disk and could not be freshness-checked: ${normalizedPath}.`);
     }
 

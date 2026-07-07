@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { DBService, getDB, initSchema } from '../from_orchestrator/db/database.ts';
-import { handleConsultCouncil } from '../from_orchestrator/mcp/server.ts';
+import { handleConsultCouncil, handleConsultCouncilSynergize } from '../from_orchestrator/mcp/server.ts';
 import type { CouncilRunnerFactory } from '../from_orchestrator/engine/council.ts';
 
 function metricIdsBefore(): Set<string> {
@@ -13,6 +13,17 @@ function metricIdsBefore(): Set<string> {
 
 function newCouncilMetrics(before: Set<string>): any[] {
   return DBService.getMcpToolCallMetrics({ toolName: 'consult_council' })
+    .filter(row => !before.has(row.tool_call_id));
+}
+
+function metricIdsBeforeForTool(toolName: string): Set<string> {
+  initSchema();
+  const rows = DBService.getMcpToolCallMetrics({ toolName });
+  return new Set(rows.map(row => row.tool_call_id));
+}
+
+function newMetricsForTool(toolName: string, before: Set<string>): any[] {
+  return DBService.getMcpToolCallMetrics({ toolName })
     .filter(row => !before.has(row.tool_call_id));
 }
 
@@ -122,6 +133,126 @@ test('partial provider failure records a partial-success MCP metric', async () =
   assert.equal(metrics.length, 1);
   assert.equal(metrics[0].status, 'PARTIAL_SUCCESS');
   assert.equal(metrics[0].run_id, result.run_id);
+  assert.equal(metrics[0].requested_provider_count, 2);
+  assert.equal(metrics[0].successful_provider_count, 1);
+  assert.equal(metrics[0].failed_provider_count, 1);
+});
+
+test('invalid synergize context records a validation-failed MCP metric without a run', async () => {
+  const toolName = 'consult_council_synergize';
+  const before = metricIdsBeforeForTool(toolName);
+
+  await assert.rejects(
+    handleConsultCouncilSynergize({
+      question: 'Review this file.',
+      context: {
+        files: [{ path: '../outside.ts', content: 'export const value = 1;' }]
+      },
+      providers: ['mock'],
+      synthesizer_provider: 'mock'
+    }),
+    /escapes/
+  );
+
+  const metrics = newMetricsForTool(toolName, before);
+  assert.equal(metrics.length, 1);
+  assert.equal(metrics[0].status, 'VALIDATION_FAILED');
+  assert.equal(metrics[0].run_id, null);
+  assert.equal(metrics[0].requested_provider_count, 2);
+  assert.match(metrics[0].error_message, /escapes/);
+});
+
+test('successful synergize call records completed MCP metric', async () => {
+  const toolName = 'consult_council_synergize';
+  const before = metricIdsBeforeForTool(toolName);
+  const runnerFactory: CouncilRunnerFactory = ({ taskId, provider }) => ({
+    async executeTask() {
+      if (taskId.startsWith('synergize_')) return '## Synergized Answer\n\nSynthesized response.';
+      return `analysis from ${provider}`;
+    },
+    async close() {}
+  });
+
+  const response = await handleConsultCouncilSynergize({
+    question: 'Review this function.',
+    context: validContext(),
+    providers: ['mock'],
+    synthesizer_provider: 'mock',
+    max_retries: 0,
+    runnerFactory
+  });
+
+  const result = response.structuredContent;
+  const metrics = newMetricsForTool(toolName, before);
+  assert.equal(result.status, 'COMPLETED');
+  assert.match(result.report, /Synthesized response/);
+  assert.equal(metrics.length, 1);
+  assert.equal(metrics[0].status, 'COMPLETED');
+  assert.equal(metrics[0].run_id, result.run_id);
+  assert.equal(metrics[0].requested_provider_count, 2);
+  assert.equal(metrics[0].successful_provider_count, 2);
+  assert.equal(metrics[0].failed_provider_count, 0);
+  assert.match(metrics[0].context_digest, /^[a-f0-9]{64}$/);
+});
+
+test('partial synergize call records partial-success MCP metric', async () => {
+  const toolName = 'consult_council_synergize';
+  const before = metricIdsBeforeForTool(toolName);
+  const runnerFactory: CouncilRunnerFactory = ({ taskId, provider }) => ({
+    async executeTask() {
+      if (taskId.startsWith('synergize_')) return '## Synergized Answer\n\nPartial synthesis.';
+      if (provider === 'chatgpt') throw new Error('simulated provider failure');
+      return `analysis from ${provider}`;
+    },
+    async close() {}
+  });
+
+  const response = await handleConsultCouncilSynergize({
+    question: 'Review this function.',
+    context: validContext(),
+    providers: ['mock', 'chatgpt'],
+    synthesizer_provider: 'mock',
+    max_retries: 0,
+    runnerFactory
+  });
+
+  const result = response.structuredContent;
+  const metrics = newMetricsForTool(toolName, before);
+  assert.equal(result.status, 'PARTIAL_SUCCESS');
+  assert.equal(metrics.length, 1);
+  assert.equal(metrics[0].status, 'PARTIAL_SUCCESS');
+  assert.equal(metrics[0].requested_provider_count, 3);
+  assert.equal(metrics[0].successful_provider_count, 2);
+  assert.equal(metrics[0].failed_provider_count, 1);
+});
+
+test('synthesis failure records failed synergize MCP metric', async () => {
+  const toolName = 'consult_council_synergize';
+  const before = metricIdsBeforeForTool(toolName);
+  const runnerFactory: CouncilRunnerFactory = ({ taskId, provider }) => ({
+    async executeTask() {
+      if (taskId.startsWith('synergize_')) throw new Error('synthesis failed');
+      return `analysis from ${provider}`;
+    },
+    async close() {}
+  });
+
+  await assert.rejects(
+    handleConsultCouncilSynergize({
+      question: 'Review this function.',
+      context: validContext(),
+      providers: ['mock'],
+      synthesizer_provider: 'mock',
+      max_retries: 0,
+      runnerFactory
+    }),
+    /synthesis failed/
+  );
+
+  const metrics = newMetricsForTool(toolName, before);
+  assert.equal(metrics.length, 1);
+  assert.equal(metrics[0].status, 'FAILED');
+  assert.match(metrics[0].run_id, /^synergize_run_/);
   assert.equal(metrics[0].requested_provider_count, 2);
   assert.equal(metrics[0].successful_provider_count, 1);
   assert.equal(metrics[0].failed_provider_count, 1);

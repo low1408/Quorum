@@ -3,7 +3,11 @@ import test from 'node:test';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { validateCouncilContext, validateCouncilRequestText } from '../from_orchestrator/mcp/contextValidation.ts';
+import {
+  redactSecretMaterial,
+  validateCouncilContext,
+  validateCouncilRequestText
+} from '../from_orchestrator/mcp/contextValidation.ts';
 
 function digest(value: string): string {
   return crypto.createHash('sha256').update(value).digest('hex');
@@ -36,6 +40,24 @@ test('rejects malformed, duplicate, empty, oversized, binary, secret, and stale 
   const validationWithRedacted = validateCouncilContext({ files: [{ path: 'a.env', content: 'API_KEY=[REDACTED]' }] });
   assert.ok(validationWithRedacted);
   assert.throws(() => validateCouncilContext({ files: [{ path: 'a.ts', content: 'x', sha256: digest('y') }] }), /stale|incorrect/);
+});
+
+test('redactSecretMaterial replaces sensitive values while preserving safe context', () => {
+  const raw = [
+    'DATABASE_PASSWORD=supersecretvalue123456',
+    'token: xoxb-123456789012345678901234',
+    'AWS_SECRET_ACCESS_KEY=1234567890123456789012345678901234567890'
+  ].join('\n');
+
+  const redacted = redactSecretMaterial(raw);
+
+  assert.equal(redacted.redactionCount, 3);
+  assert.match(redacted.content, /DATABASE_PASSWORD=\[REDACTED_SECRET\]/);
+  assert.match(redacted.content, /token: \[REDACTED_SECRET:TOKEN\]/);
+  assert.match(redacted.content, /AWS_SECRET_ACCESS_KEY=\[REDACTED_SECRET\]/);
+  assert.doesNotThrow(() => validateCouncilContext({
+    files: [{ path: 'README.md', content: redacted.content }]
+  }));
 });
 
 test('rejects unknown fields, unsafe request text, unsafe metadata, and sensitive paths', () => {

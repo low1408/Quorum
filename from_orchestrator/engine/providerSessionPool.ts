@@ -44,6 +44,12 @@ export class ProviderSessionPool {
     return item;
   }
 
+  public set(providerId: string, item: SessionPoolItem): void {
+    item.providerId = providerId;
+    item.lastUsedAt = Date.now();
+    this.items.set(providerId, item);
+  }
+
   public get(providerId: string): SessionPoolItem | undefined {
     return this.items.get(providerId);
   }

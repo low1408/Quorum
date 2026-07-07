@@ -42,6 +42,7 @@ test('builds immutable runtime config from an explicit environment', () => {
     HEADLESS: 'false',
     DISPLAY: ':0',
     HUMAN_TYPING: 'false',
+    SYNERGIZER_PROVIDER: 'claude',
     REQUIRE_STRUCTURED_REVIEW_CONTEXT: 'true'
   }, 'linux');
 
@@ -50,6 +51,7 @@ test('builds immutable runtime config from an explicit environment', () => {
   assert.equal(runtime.cdpEndpoint, 'http://127.0.0.1:9222');
   assert.equal(runtime.headless, false);
   assert.equal(runtime.humanTyping, false);
+  assert.equal(runtime.synergizerProvider, 'claude');
   assert.equal(runtime.requireStructuredReviewContext, true);
   assert.equal(Object.isFrozen(runtime), true);
 });
